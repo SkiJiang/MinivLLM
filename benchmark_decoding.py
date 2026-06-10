@@ -1,3 +1,5 @@
+"""Paged-attention decode benchmark for PyTorch and Triton implementations."""
+
 import torch
 import time
 import triton 
@@ -19,30 +21,38 @@ def paged_attention_decode_kernel(
     max_num_blocks: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """Optimized paged attention kernel for decode phase."""
+    """Compute one decode attention output per batch item and query head."""
+    # Grid axes: batch index and query head index.
     batch_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
     
+    # GQA maps several query heads to one KV head.
     kv_head_idx = head_idx // (num_heads // num_kv_heads)
+    # Number of valid tokens in this sequence's KV history.
     context_len = tl.load(context_lens_ptr + batch_idx)
     
+    # Load the current query vector.
     offs_d = tl.arange(0, head_dim)
     q_offset = batch_idx * num_heads * head_dim + head_idx * head_dim + offs_d
     q = tl.load(query_ptr + q_offset)
     
+    # Online softmax state for the single query.
     acc = tl.zeros([head_dim], dtype=tl.float32)
     l_i = 0.0
     m_i = -1e10
     
+    # Iterate over all possible cache tokens in fixed-size chunks.
     max_chunks = tl.cdiv(max_num_blocks * block_size, BLOCK_N)
     
     for chunk_idx in range(max_chunks):
+        # token_start is a logical token position, not a physical cache offset.
         token_start = chunk_idx * BLOCK_N
         
         if token_start < context_len:
             offs_n = token_start + tl.arange(0, BLOCK_N)
             mask_n = offs_n < context_len
             
+            # Fill attention scores for this chunk by following block_tables.
             qk = tl.zeros([BLOCK_N], dtype=tl.float32) - 1e10
             
             for i in range(BLOCK_N):
@@ -52,10 +62,12 @@ def paged_attention_decode_kernel(
                     block_offset = token_idx % block_size
                     
                     if block_num < max_num_blocks:
+                        # block_tables maps logical blocks to physical cache blocks.
                         block_table_offset = batch_idx * max_num_blocks + block_num
                         physical_block_idx = tl.load(block_tables_ptr + block_table_offset)
                         
                         if physical_block_idx != -1:
+                            # Load K from (num_blocks, block_size, num_kv_heads, head_dim).
                             k_offset = (physical_block_idx * block_size * num_kv_heads * head_dim +
                                        block_offset * num_kv_heads * head_dim +
                                        kv_head_idx * head_dim + offs_d)
@@ -65,8 +77,10 @@ def paged_attention_decode_kernel(
                             mask_i = tl.arange(0, BLOCK_N) == i
                             qk = tl.where(mask_i, score, qk)
             
+            # Invalid chunk entries should not affect softmax.
             qk = tl.where(mask_n, qk, -1e10)
             
+            # Numerically stable online softmax update.
             m_ij = tl.max(qk)
             m_i_new = tl.maximum(m_i, m_ij)
             alpha = tl.exp(m_i - m_i_new)
@@ -75,6 +89,7 @@ def paged_attention_decode_kernel(
             acc = acc * alpha
             l_i = l_i * alpha
             
+            # Accumulate weighted V vectors from the same physical cache blocks.
             for i in range(BLOCK_N):
                 token_idx = token_start + i
                 if token_idx < context_len:
@@ -86,11 +101,13 @@ def paged_attention_decode_kernel(
                         physical_block_idx = tl.load(block_tables_ptr + block_table_offset)
                         
                         if physical_block_idx != -1:
+                            # Load V from the paged cache.
                             v_offset = (physical_block_idx * block_size * num_kv_heads * head_dim +
                                        block_offset * num_kv_heads * head_dim +
                                        kv_head_idx * head_dim + offs_d)
                             v_vec = tl.load(v_cache_ptr + v_offset)
                             
+                            # Extract scalar p[i] with a one-hot mask.
                             mask_i = tl.arange(0, BLOCK_N) == i
                             weight = tl.sum(tl.where(mask_i, p, 0.0))
                             
@@ -99,6 +116,7 @@ def paged_attention_decode_kernel(
             
             m_i = m_i_new
     
+    # Store the normalized output vector.
     output = acc / l_i
     output_offset = batch_idx * num_heads * head_dim + head_idx * head_dim + offs_d
     tl.store(output_ptr + output_offset, output)
@@ -116,12 +134,16 @@ def paged_attention_decode_triton(
     head_dim: int,
     block_size: int
 ) -> torch.Tensor:
+    """Launch the Triton paged-attention decode kernel."""
     batch_size = query.shape[0]
     max_num_blocks = block_tables.shape[1]
+    # Kernel pointer arithmetic assumes contiguous query storage.
     query = query.contiguous()
     output = torch.empty_like(query)
     
+    # Wider heads use smaller chunks to keep register/shared-memory pressure down.
     BLOCK_N = 64 if head_dim <= 128 else 32
+    # One program per batch item and query head.
     grid = (batch_size, num_heads)
     
     paged_attention_decode_kernel[grid](
@@ -145,16 +167,19 @@ def decode_torch_optimized(
     head_dim: int,
     block_size: int,
 ) -> torch.Tensor:
+    """Vectorized PyTorch baseline that first gathers paged cache into dense tensors."""
     batch_size = q.shape[0]
     device = q.device
     dtype = q.dtype
     
     max_context_len = context_lens.max().item()
     
+    # Dense padded buffers make PyTorch matmul simple but add gather/copy overhead.
     padded_k = torch.zeros(batch_size, max_context_len, num_kv_heads, head_dim, device=device, dtype=dtype)
     padded_v = torch.zeros(batch_size, max_context_len, num_kv_heads, head_dim, device=device, dtype=dtype)
     
     for i in range(batch_size):
+        # Follow the block table and truncate the final block to seq_len.
         seq_len = context_lens[i].item()
         num_blocks_needed = (seq_len + block_size - 1) // block_size
         
@@ -169,6 +194,7 @@ def decode_torch_optimized(
             padded_v[i, :seq_len] = gathered_v
     
     if num_kv_heads != num_heads:
+        # Expand grouped KV heads so standard attention can use one KV head per Q.
         num_groups = num_heads // num_kv_heads
         padded_k = padded_k.repeat_interleave(num_groups, dim=2)
         padded_v = padded_v.repeat_interleave(num_groups, dim=2)
@@ -177,8 +203,10 @@ def decode_torch_optimized(
     padded_k = padded_k.transpose(1, 2)
     padded_v = padded_v.transpose(1, 2)
     
+    # q attends to the full padded context for each sequence.
     attn_scores = torch.matmul(q, padded_k.transpose(-2, -1)) * scale
     
+    # Mask out padding beyond each sequence length.
     mask = torch.arange(max_context_len, device=device)[None, :] < context_lens[:, None]
     mask = mask[:, None, None, :]
     attn_scores = attn_scores.masked_fill(~mask, float('-inf'))
@@ -211,7 +239,7 @@ def naive_decode_attention(
     
     max_context_len = context_lens.max().item()
     
-    # Gather K, V into full sequences (inefficient for large contexts)
+    # Gather K/V into Python lists first, which is intentionally simple but slow.
     all_k = []
     all_v = []
     
@@ -234,7 +262,7 @@ def naive_decode_attention(
             all_k.append(seq_k)
             all_v.append(seq_v)
     
-    # Pad sequences
+    # Pad variable-length gathered K/V into dense tensors for batch matmul.
     padded_k = torch.zeros(batch_size, max_context_len, num_kv_heads, head_dim,
                            device=device, dtype=dtype)
     padded_v = torch.zeros(batch_size, max_context_len, num_kv_heads, head_dim,
@@ -245,18 +273,18 @@ def naive_decode_attention(
         padded_k[i, :seq_len] = k_seq
         padded_v[i, :seq_len] = v_seq
     
-    # GQA
     if num_kv_heads != num_heads:
+        # Repeat KV heads to match query-head count for a standard attention call.
         num_groups = num_heads // num_kv_heads
         padded_k = padded_k.repeat_interleave(num_groups, dim=2)
         padded_v = padded_v.repeat_interleave(num_groups, dim=2)
     
-    # Reshape and compute attention
+    # Reshape to (B, H, 1, D) x (B, H, D, N).
     q = q.unsqueeze(2)  # (B, H, 1, D)
     padded_k = padded_k.transpose(1, 2)  # (B, H, N, D)
     padded_v = padded_v.transpose(1, 2)  # (B, H, N, D)
     
-    # This is the inefficient part - materializes full attention matrix
+    # Materializes the full attention score vector for every batch/head.
     attn_scores = torch.matmul(q, padded_k.transpose(-2, -1)) * scale
     
     mask = torch.arange(max_context_len, device=device)[None, :] < context_lens[:, None]
@@ -272,24 +300,24 @@ def naive_decode_attention(
 
 def setup_test_data(batch_size, seq_len, num_heads, num_kv_heads, head_dim, block_size, device='cuda'):
     """Setup test data for benchmarking"""
-    # Query: (batch_size, num_heads, head_dim)
+    # Query represents the current decode token for each sequence.
     q = torch.randn(batch_size, num_heads, head_dim, device=device, dtype=torch.float16)
     
-    # Calculate number of blocks needed
+    # Allocate enough physical blocks for every sequence's full context.
     max_num_blocks = (seq_len + block_size - 1) // block_size
     total_blocks = batch_size * max_num_blocks
     
-    # KV Cache: (total_blocks, block_size, num_kv_heads, head_dim)
+    # KV cache mimics ModelRunner's paged layout.
     k_cache = torch.randn(total_blocks, block_size, num_kv_heads, head_dim, device=device, dtype=torch.float16)
     v_cache = torch.randn(total_blocks, block_size, num_kv_heads, head_dim, device=device, dtype=torch.float16)
     
-    # Block tables: (batch_size, max_num_blocks)
+    # Consecutive physical block ids make correctness inspection straightforward.
     block_tables = torch.arange(total_blocks, device=device, dtype=torch.int32).reshape(batch_size, max_num_blocks)
     
-    # Context lengths: (batch_size,)
+    # Benchmark uses equal sequence lengths for clearer timing.
     context_lens = torch.full((batch_size,), seq_len, device=device, dtype=torch.int32)
     
-    # Scale
+    # Standard attention scale.
     scale = 1.0 / (head_dim ** 0.5)
     
     return q, k_cache, v_cache, block_tables, context_lens, scale
@@ -304,14 +332,14 @@ def benchmark(batch_size, seq_len, num_heads=32, num_kv_heads=8,
     print(f"num_kv_heads={num_kv_heads}, head_dim={head_dim}, block_size={block_size}")
     print(f"{'='*70}")
     
-    # Setup data
+    # Synthetic data isolates attention kernel performance from model overhead.
     q, k_cache, v_cache, block_tables, context_lens, scale = setup_test_data(
         batch_size, seq_len, num_heads, num_kv_heads, head_dim, block_size
     )
     
     results = {}
     
-    # 1. Naive implementation (your original?)
+    # 1. Naive implementation.
     print("\n1. Testing Naive PyTorch implementation...")
     for _ in range(10):  # warmup
         _ = naive_decode_attention(q, k_cache, v_cache, block_tables, context_lens,
@@ -327,7 +355,7 @@ def benchmark(batch_size, seq_len, num_heads=32, num_kv_heads=8,
     results['Naive PyTorch'] = naive_time
     print(f"   Time: {naive_time*1000:.3f}ms")
     
-    # 2. Optimized PyTorch
+    # 2. Optimized PyTorch baseline.
     print("\n2. Testing Optimized PyTorch implementation...")
     for _ in range(10):  # warmup
         _ = decode_torch_optimized(q, k_cache, v_cache, block_tables, context_lens,
@@ -343,7 +371,7 @@ def benchmark(batch_size, seq_len, num_heads=32, num_kv_heads=8,
     results['Optimized PyTorch'] = pytorch_time
     print(f"   Time: {pytorch_time*1000:.3f}ms")
     
-    # 3. Triton
+    # 3. Triton paged attention kernel.
     print("\n3. Testing Triton implementation...")
     for _ in range(10):  # warmup
         _ = paged_attention_decode_triton(q, k_cache, v_cache, block_tables, context_lens,
@@ -363,6 +391,7 @@ def benchmark(batch_size, seq_len, num_heads=32, num_kv_heads=8,
 
 
 if __name__ == "__main__":
+    # Run a small sweep over context sizes and batch sizes.
     print("\n" + "="*70)
     print("COMPREHENSIVE PAGED ATTENTION DECODE BENCHMARK")
     print("Comparing: Naive PyTorch | Optimized PyTorch | Triton")

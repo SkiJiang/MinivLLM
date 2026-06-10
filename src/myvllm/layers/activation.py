@@ -1,3 +1,5 @@
+"""Activation functions used by transformer feed-forward blocks."""
+
 import torch 
 import torch.nn as nn
 import torch.nn.functional as F
@@ -5,8 +7,11 @@ import time
 
 class SiluAndMul(nn.Module):
     """
-    A custom activation layer that applies the SiLU (Sigmoid Linear Unit) activation
-    function followed by element-wise multiplication with the input tensor.
+    SwiGLU-style activation used after a fused gate/up projection.
+
+    The input's last dimension is expected to be twice the intermediate size.
+    The first half is the gate branch, the second half is the value/up branch:
+    output = silu(gate) * value.
     """
 
     def __init__(self):
@@ -14,19 +19,23 @@ class SiluAndMul(nn.Module):
 
     @torch.compile
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Split only on the hidden dimension so all leading dimensions
+        # (batch/sequence or varlen tokens) are preserved unchanged.
         x, y = x.chunk(2, -1)
+        # SiLU(gate) controls how much of the value branch passes through.
         return F.silu(x) * y
 
 if __name__ == "__main__":
-    # Example usage
+    # Local microbenchmark for the fused activation shape used by large MLPs.
     layer = SiluAndMul().cuda()
-    input_tensor = torch.randn(8, 4000, 8000).cuda()  # Example input tensor with shape (400, 800)
+    input_tensor = torch.randn(8, 4000, 8000).cuda()
     
-    for _ in range(10):  # Warm-up iterations
+    # Warm-up avoids including one-time CUDA kernel setup in timing.
+    for _ in range(10):
         _ = layer(input_tensor)
 
     times = []
-    for _ in range(100):  # Timing iterations
+    for _ in range(100):
         torch.cuda.synchronize()
         start_time = time.time()
         output_tensor = layer(input_tensor)

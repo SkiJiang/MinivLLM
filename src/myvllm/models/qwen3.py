@@ -1,14 +1,12 @@
+"""Qwen3 model components built from the local tensor-parallel layers."""
+
 from myvllm.layers import *
 import torch 
 import torch.nn as nn
 
-# Qwen3Attention: 
-# qkv projection
-# if not qkv_bias: then rms_norm
-# apply rotary embedding to q, k
-# attention
-# output projection
 class Qwen3Attention(nn.Module):
+    """Qwen3 attention with fused QKV, optional Q/K norm, RoPE, and paged attention."""
+
     def __init__(
         self,
         hidden_size: int,
@@ -25,37 +23,44 @@ class Qwen3Attention(nn.Module):
         super().__init__()
         self.tp_size = dist.get_world_size()
 
+        # total_* values are global checkpoint counts; num_* values are local to
+        # the current tensor-parallel rank.
         self.total_num_heads = num_heads
         self.num_heads = num_heads // self.tp_size
 
         self.total_num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
-        # self.num_kv_heads is per-GPU value (divided by tp_size)
         self.num_kv_heads = self.total_num_kv_heads // self.tp_size
 
         self.head_dim = head_dim if head_dim is not None else hidden_size // num_heads
         self.scale = scale
 
+        # Fused QKV keeps three projections in one matrix multiply.  The custom
+        # weight loader copies q_proj/k_proj/v_proj checkpoint tensors into the
+        # correct packed slices.
         self.qkv_projection = QKVColumnParallelLinear(
-            input_size=hidden_size,  # Fixed: was head_dim * total_num_heads, should be hidden_size
+            input_size=hidden_size,
             head_size=head_dim,
             num_heads=self.total_num_heads,
             num_kv_heads=self.total_num_kv_heads,
             bias=qkv_bias,
         )
+        # Per-rank packed output split sizes.
         self.q_size = head_dim * self.num_heads
         self.kv_size = head_dim * self.num_kv_heads
         self.qkv_bias = qkv_bias
 
-        # Q and K norms as used in Qwen3
+        # Qwen3 uses RMSNorm on Q and K when QKV projection has no bias.
         self.q_norm = LayerNorm(torch.ones(head_dim))
         self.k_norm = LayerNorm(torch.ones(head_dim))
 
+        # Standard Qwen RoPE table.
         self.rotary_emb = RotaryEmbedding(
             base=base,
             rotary_embedding=head_dim,
             max_position=max_position
         )
 
+        # Attention handles both prefill flash attention and decode paged attention.
         self.attention = Attention(
             self.num_heads,
             head_dim,
@@ -64,6 +69,8 @@ class Qwen3Attention(nn.Module):
             block_size
         )
 
+        # Output projection consumes local heads and all-reduces the full hidden
+        # state across ranks.
         self.o_proj = RowParallelLinear(
             input_size=head_dim * self.total_num_heads,
             output_size=hidden_size,
@@ -75,61 +82,48 @@ class Qwen3Attention(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        # Input: x shape (B, N, hidden_size) - REPLICATED on all GPUs
+        """Run the Qwen3 attention sublayer."""
+        # x is replicated before the column-parallel projection.
 
-        # ===== QKV Projection (Column Parallel - THIS IS WHERE SHARDING HAPPENS) =====
-        # Output shape PER GPU: (B, N, head_dim * (num_heads + 2*num_kv_heads))
-        # where num_heads = total_num_heads/tp_size
-        #       num_kv_heads = total_num_kv_heads/tp_size
+        # Projection output contains only this rank's heads.
         qkv = self.qkv_projection(x)
 
-        # ===== Split QKV =====
-        # q_size = head_dim * num_heads           - Per-GPU size!
-        # kv_size = head_dim * num_kv_heads       - Per-GPU size!
+        # Split packed local Q/K/V segments.
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        # Handle both batched (3D) and varlen (2D) inputs
-        # Varlen: q shape: (total_tokens, q_size) where q_size = num_heads * head_dim
-        # Batched: q shape: (B, N, q_size)
+        # Prefill can be a 2D varlen tensor; decode graph capture can use a
+        # batched tensor.  Both expose (heads, head_dim) before attention.
         if q.dim() == 2:
-            # Varlen mode: (total_tokens, q_size) -> (total_tokens, num_heads, head_dim)
             q = q.view(-1, self.num_heads, self.head_dim)
             k = k.view(-1, self.num_kv_heads, self.head_dim)
             v = v.view(-1, self.num_kv_heads, self.head_dim)
         else:
-            # Batched mode: (B, N, q_size) -> (B, N, num_heads, head_dim)
             B, N = q.size(0), q.size(1)
             q = q.view(B, N, self.num_heads, self.head_dim)
             k = k.view(B, N, self.num_kv_heads, self.head_dim)
             v = v.view(B, N, self.num_kv_heads, self.head_dim)
 
-        # Apply Q and K norms - these are used in Qwen3 to stabilize attention
-        # Applied to q and k because they participate in attention_weight computation
-        # Removes possibility of large numbers that cause softmax instability
+        # Q/K normalization stabilizes dot-product magnitudes before softmax.
         if self.qkv_bias is False:
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        # DEBUG: Print positions to diagnose issue
+        # Kept import is harmless and useful for quick local diagnostics.
         import sys
 
+        # RoPE adds positional phase to Q/K.
         q, k = self.rotary_emb(positions, q, k) 
 
         o = self.attention(q, k, v)
-        # o shape: (B*N, num_heads, head_dim)     - Per-GPU, different heads per GPU
 
-        # ===== Output Projection (Row Parallel - COMMUNICATION HAPPENS HERE by dist.all_reduce) =====
+        # Row parallel output projection reconstructs hidden_size on every rank.
         o = self.o_proj(o)
-        # Input: (B*N, num_heads * head_dim) sharded across GPUs
-        # Output: (B*N, hidden_size) REPLICATED on all GPUs (after all_reduce)
 
         return o
 
-# Qwen3MLP
-# gate_up
-# activateion
-# gate_down
 class Qwen3MLP(nn.Module):
+    """Qwen3 feed-forward network with SwiGLU activation."""
+
     def __init__(
         self,
         hidden_size: int,
@@ -137,12 +131,14 @@ class Qwen3MLP(nn.Module):
         bias: bool = True,
     ):
         super().__init__()
+        # Fused gate/up projection halves the number of matmul launches.
         self.gate_up = MergedColumnParallelLinear(
             input_size=hidden_size,
             output_sizes=[intermediate_size] * 2,
             bias=bias,
         )
         self.activation = SiluAndMul()
+        # Down projection sums partial intermediate features across ranks.
         self.down_proj = RowParallelLinear(
             input_size=intermediate_size,
             output_size=hidden_size,
@@ -150,16 +146,14 @@ class Qwen3MLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run gate/up, activation, and down projection."""
         x = self.down_proj(self.activation(self.gate_up(x)))
         return x
 
 
-# Qwen3DecoderLayer
-# input_layernorm, also consider residual
-# self_attn
-# layer_norm post attention
-# mlp
 class Qwen3DecoderLayer(nn.Module):
+    """One Qwen3 decoder block with residual-carry RMSNorm."""
+
     def __init__(
         self,
         hidden_size: int,
@@ -176,6 +170,7 @@ class Qwen3DecoderLayer(nn.Module):
         block_size: int = 256,
     ):
         super().__init__()
+        # Gamma tensors are checkpoint-loadable RMSNorm weights.
         gamma = torch.ones(hidden_size)
         self.input_layernorm = LayerNorm(gamma)
         self.self_attn = Qwen3Attention(
@@ -198,16 +193,19 @@ class Qwen3DecoderLayer(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
+        """Apply attention and MLP sublayers with residual state."""
         if residual is not None:
             x, residual = self.input_layernorm(x, residual)
         else:
-            residual = x  # Save BEFORE normalization
+            # First layer starts the residual stream.
+            residual = x
             x = self.input_layernorm(x)
-        # Compute positions based on context (respecting sequence boundaries for batched prefill)
+
+        # Packed prefill requires positions to restart for every sequence; decode
+        # uses each sequence's current length minus one.
         from myvllm.utils import get_context
         context = get_context()
         if context.is_prefill and context.cu_seqlens_q is not None:
-            # For batched prefill, create positions that restart at 0 for each sequence
             positions = []
             cu_seqlens = context.cu_seqlens_q.cpu().tolist()
             for i in range(len(cu_seqlens) - 1):
@@ -215,23 +213,19 @@ class Qwen3DecoderLayer(nn.Module):
                 positions.extend(range(seq_len))
             positions = torch.tensor(positions, dtype=torch.long, device=x.device)
         elif context.is_prefill:
-            # For single sequence prefill, use sequential positions
             positions = torch.arange(x.size(0), device=x.device)
         else:
-            # For decode, use context_lens - 1 as positions (current position for each sequence)
             positions = context.context_lens - 1
 
         x = self.self_attn(x, positions=positions)
-        # Residual connection always on for attention output
+        # post_attention_layernorm adds attention output to residual internally.
         x, residual = self.post_attention_layernorm(x, residual)
         x = self.mlp(x)
         return x, residual
 
-# Qwen3Model
-# embedding
-# layers stack
-# final layer norm
 class Qwen3Model(nn.Module):
+    """Qwen3 transformer backbone without the LM head."""
+
     def __init__(
         self,
         vocab_size: int,
@@ -250,10 +244,12 @@ class Qwen3Model(nn.Module):
         block_size: int = 256,
     ):
         super().__init__()
+        # Vocab-parallel embedding returns a replicated hidden state after reduce.
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=vocab_size,
             embedding_dim = hidden_size
         )
+        # Decoder stack with identical per-forward context metadata.
         self.layers = nn.ModuleList([
             Qwen3DecoderLayer(
                 hidden_size=hidden_size,
@@ -274,6 +270,7 @@ class Qwen3Model(nn.Module):
         self.norm = LayerNorm(gamma)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Run embeddings, decoder layers, and final RMSNorm."""
         x = self.embed_tokens(input_ids)
         residual = None
         for layer in self.layers:
@@ -282,10 +279,10 @@ class Qwen3Model(nn.Module):
         return x
 
 
-
-# Qwen3ForCausalLM
-# add lm_head on top of Qwen3Model
 class Qwen3ForCausalLM(nn.Module):
+    """Qwen3 backbone plus vocabulary projection for next-token logits."""
+
+    # Mapping documents how checkpoint names correspond to fused local modules.
     packed_module_mapping = {
         "q_proj": ('q_proj', 'q'),
         "k_proj": ('k_proj', 'k'),
@@ -312,6 +309,7 @@ class Qwen3ForCausalLM(nn.Module):
         block_size: int = 256,
     ):
         super().__init__()
+        # Infer head_dim from hidden_size/num_heads if the config omits it.
         head_dim = head_dim if head_dim is not None else hidden_size // num_heads
         self.model = Qwen3Model(
             vocab_size=vocab_size,
@@ -334,17 +332,22 @@ class Qwen3ForCausalLM(nn.Module):
             embedding_dim=hidden_size
         )
         if tie_word_embeddings:
+            # Tie output projection to token embedding when the model config
+            # expects shared weights.
             self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Return hidden states; logits are computed separately for sampling."""
         x = self.model(input_ids)
         return x 
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project hidden states to vocabulary logits."""
         logits = self.lm_head(hidden_states)
         return logits
 
 if __name__ == "__main__":
+    # Lightweight construction smoke test for the Qwen3 module stack.
     model = Qwen3ForCausalLM(
         vocab_size=50257,
         hidden_size=768,

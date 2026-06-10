@@ -1,3 +1,11 @@
+"""CUDA/distributed model execution and input preparation.
+
+ModelRunner is intentionally lower level than LLMEngine.  It knows about tensor
+parallel ranks, CUDA graph capture, KV-cache memory layout, and the small
+shared-memory RPC mechanism used to ask worker ranks to run the same method as
+rank 0.
+"""
+
 import math
 import torch
 import pickle
@@ -13,20 +21,28 @@ from myvllm.engine.sequence import Sequence
 from myvllm.utils import *
 
 class ModelRunner:
+    """Run model forward passes on one rank and coordinate peer ranks."""
+
     def __init__(self, config: dict, rank: int, event: Event | list[Event]):
         self.config = config
+        # On rank 0 this is a list of worker events.  On worker ranks it is the
+        # single event used to wake this rank after shared memory is written.
         self.event = event
 
-        # set distributed config
+        # Configuration used by scheduling, cache layout, and CUDA graph capture.
         self.block_size = config['block_size']
         self.world_size = config['world_size']
+        # enforce_eager disables CUDA graph replay, which is useful for debugging
+        # shape issues or running environments that do not support graph capture.
         self.enforce_eager = config.get('enforce_eager', False)
 
         self.rank = rank
+        # All ranks join the same NCCL group.  Tensor-parallel layers query this
+        # process group to decide which weight shard they own.
         dist.init_process_group('nccl', "tcp://localhost:12345", world_size=config['world_size'], rank=rank)
         torch.cuda.set_device(rank)
 
-        # set model
+        # Instantiate the architecture that matches the checkpoint directory/name.
         path_str = self.config['model_name_or_path']
         model_name = Path(path_str).name
         match model_name:
@@ -68,10 +84,10 @@ class ModelRunner:
             case _:
                 raise Exception(f"Unsupported model: {config['model_name_or_path']}")
 
-        # Load weights in GPU (model moved to GPU before loading weights)
+        # Move parameters to this rank's GPU before loading checkpoint weights.
         self.model = self.model.cuda(rank)
 
-        # Load pretrained weights if model_name_or_path is provided
+        # Weight loading understands the custom fused QKV and gate/up layers.
         if config.get('model_name_or_path'):
             from myvllm.utils.loader import load_weights_from_checkpoint
             load_weights_from_checkpoint(self.model, config['model_name_or_path'])
@@ -81,69 +97,75 @@ class ModelRunner:
 
         self.sampler = SamplerLayer()
 
-        # Store default dtype before it's needed in allocate_kv_cache
+        # The cache size computation needs itemsize, so remember the dtype before
+        # set_default_device/set_default_dtype are restored later.
         self.default_dtype = torch.get_default_dtype()
 
-        # Debug flag for first decode step
+        # Debug flag for first decode step; kept for quick local diagnostics.
         self._first_decode = False
 
-        # warm up model so that we know peak memory usage
+        # Warmup measures peak activation memory, which is subtracted from the
+        # free memory budget before allocating the KV cache pool.
         self.warmup_model()
-        # allocate kv cache
+
+        # Allocate one paged KV-cache pool and attach layer-specific views.
         self.allocate_kv_cache()
-        # capture cuda graph for decoding
+
+        # Decode uses static shapes and benefits from CUDA graph replay.
         if not self.enforce_eager:
             self.capture_cudagraph()
 
+        # Restore process-wide defaults after warmup/capture setup.
         torch.set_default_device(f'cuda:{rank}')
         torch.set_default_dtype(self.default_dtype)
 
-        # IMPORTANT: Set up shared memory and barrier AFTER all model initialization
-        # This ensures both ranks complete warmup/allocation before rank 1 enters its event loop
         if self.world_size > 1:
-            # Synchronize before setting up shared memory
+            # Shared memory is created only after every rank has initialized the
+            # model and cache; otherwise a worker could enter its loop before the
+            # master is ready to send commands.
             dist.barrier()
             if self.rank == 0:
-                # Try to clean up existing shared memory first
+                # Clean up a previous crashed run's segment if it exists.
                 try:
                     old_shm = SharedMemory(name='myvllm')
                     old_shm.close()
                     old_shm.unlink()
                 except FileNotFoundError:
-                    pass  # Doesn't exist, which is fine
+                    pass
                 self.shm = SharedMemory(name='myvllm', create=True, size=2**20)
-                # Barrier to ensure rank 1 waits until shared memory is created
+                # Release workers only after the segment exists.
                 dist.barrier()
             else:
-                # Wait for rank 0 to create shared memory
+                # Workers wait for rank 0, then attach to the existing segment.
                 dist.barrier()
                 self.shm = SharedMemory(name='myvllm')
-                # Don't call self.loop() here - let the spawning code handle it
-                # Otherwise we'll be stuck in an infinite loop during __init__
 
-    # only use read when rank != 0
     def read_shm(self):
+        """Worker-side read of a serialized method call from shared memory."""
         assert self.world_size > 1 and self.rank != 0, "read_shm can only be called when world_size > 1 and rank != 0"
+        # event.wait() blocks until rank 0 has written method bytes.
         self.event.wait()
-        n = int.from_bytes(self.shm.buf[:4], 'little') # read length
+        # The first four bytes store payload length; the payload is a pickle of
+        # (method_name, *args).
+        n = int.from_bytes(self.shm.buf[:4], 'little')
         method_name, *args = pickle.loads(self.shm.buf[4:n+4])
         self.event.clear()
         return method_name, args
 
-    # only use write when rank == 0
     def write_shm(self, method_name: str, args: tuple):
+        """Rank-0 write of a serialized method call for worker ranks."""
         assert self.world_size > 1 and self.rank == 0, "write_shm can only be called when world_size > 1 and rank == 0"
-        # encode the length first
-        # Flatten: (method_name, args) where args is a tuple -> (method_name, *args)
+        # Flatten args so read_shm() can return method_name and a normal arg list.
         data = pickle.dumps((method_name, *args))
         n = len(data)
         self.shm.buf[:4] = n.to_bytes(4, 'little')
         self.shm.buf[4:n+4] = data
+        # Wake every worker after the payload is fully written.
         for event in self.event:
             event.set()
 
-    # close shared memory, destroy process group, delete graphs
     def exit(self):
+        """Release CUDA graph, shared memory, and distributed resources."""
         if self.world_size > 1:
             self.shm.close()
             if self.rank == 0:
@@ -156,60 +178,61 @@ class ModelRunner:
         if dist.is_initialized():
             dist.destroy_process_group()
     
-    # wait to read method and args from shared memory
-    # execute the method with args
-    # write results back to shared memory
     def loop(self):
+        """Worker event loop that mirrors rank-0 method calls."""
         assert self.world_size > 1 and self.rank != 0, "loop can only be called when world_size > 1 and rank != 0"
         while True:
             method_name, args = self.read_shm()
-            self.call(method_name, *args) # Unpack args when calling
+            self.call(method_name, *args)
             if method_name == 'exit':
                 self.exit()
                 break
 
-    # will be called by both rank == 0 and rank != 0
-    # given method name and args from shared memory
-    # execute the method and return results
     def call(self, method_name: str, *args: dict):
-        if self.world_size > 1 and self.rank == 0: # will be called in main engine
+        """Dispatch a named method locally and broadcast it from rank 0."""
+        if self.world_size > 1 and self.rank == 0:
             self.write_shm(method_name, args)
         method = getattr(self, method_name, None)
         if method:
             return method(*args)
         raise ValueError(f"Unknown method: {method_name}")
 
-    # cleanup memory
-    # compute max number of sequence based on max token and max model length
-    # run empty sequence to warm up the model
-    # clear memory
     def warmup_model(self):
+        """Run a synthetic prefill to measure peak activation memory."""
+        # Start from a clean CUDA allocator snapshot so peak_memory_stats reflects
+        # warmup execution rather than previous setup allocations.
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
+
+        # Fill the configured token budget with max-length synthetic sequences.
+        # The shapes are intentionally pessimistic so later real batches fit.
         max_tokens = self.config['max_num_batch_tokens']
         max_model_length = self.config['max_model_length']
         batch_size = max_tokens // max_model_length
         seqs = [Sequence(token_ids=[0]*max_model_length, block_size=self.config['block_size']) for _ in range(batch_size)]
+
+        # The output is discarded; only allocator statistics matter.
         self.run(seqs, is_prefill=True)
         torch.cuda.empty_cache()
 
-    # allocate kv cache memory blocks for model
     def allocate_kv_cache(self):
-        # find all available memory
+        """Allocate the paged KV-cache pool and bind layer cache views."""
+        # Determine how much memory can be used for cache after reserving room
+        # for the model's observed peak activation usage.
         free_mem, total_mem = torch.cuda.mem_get_info()
         total_free_mem = free_mem * self.config['gpu_memory_utilization']
         peak_mem_usage = torch.cuda.memory_stats()['allocated_bytes.all.peak']
         current_mem_usage = torch.cuda.memory_stats()['allocated_bytes.all.current']
-        # reserve some room for peak memory usage during model execution
         available_mem = total_free_mem - (peak_mem_usage - current_mem_usage)
         
-        # find parameters to compute kv cache size
+        # Each cache block stores both K and V for every layer, local KV head,
+        # token position in the block, and head dimension.
         num_layers = self.config['num_layers']
         num_kv_heads = self.config['num_kv_heads'] // self.world_size
         head_dim = self.config['head_dim'] if 'head_dim' in self.config else self.config['hidden_size'] // self.config['num_heads']
 
-        # check whether the current free memory can hold at least one block
-        # compute the actual byte required of each block
+        # bytes/block = block_size * (K,V) * layers * local_kv_heads * head_dim *
+        # dtype_size.  This is the physical page size used by paged attention.
         block_bytes = self.block_size * 2 * num_layers * num_kv_heads * head_dim * self.default_dtype.itemsize
         num_available_kv_blocks = int(available_mem // block_bytes)
         assert num_available_kv_blocks >= 1, f'Not enough memory to hold at least one block of KV cache on rank {self.rank}'
@@ -241,66 +264,75 @@ class ModelRunner:
         if self.rank == 0:
             print(f"[Rank 0] Global max_cached_blocks (min): {self.config['max_cached_blocks']}")
 
-        # allocate max possible kv cache for the model, instead for each sequence
-        # this is the key for paged attention: one giant KV cache pool, divided into blocks
-        # IMPORTANT: Use zeros() instead of empty() to avoid garbage values
+        # Allocate one contiguous pool instead of per-sequence tensors.  Attention
+        # kernels address it through block_tables and slot_mapping.
         allocated_kv_cache = torch.zeros(2, self.config['num_layers'], self.config['max_cached_blocks'], self.block_size, num_kv_heads, head_dim, device=f'cuda:{self.rank}')
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, 'k_cache') and hasattr(module, 'v_cache'):
+                # Each attention layer receives a view into its layer slice:
+                # (num_blocks, block_size, local_kv_heads, head_dim).
                 module.k_cache = allocated_kv_cache[0, layer_id]
                 module.v_cache = allocated_kv_cache[1, layer_id]
                 layer_id += 1
 
-    # given seqs
-    # prepare the data needed for a prefill forward pass
-    # taking prefix cache into consideration: 
-    # input_ids, positions, cu_seqlens_q/k, slot_mapping (where to write new KV values), block_tables (where to read KV values)
-    # cu_seqlens_q = [0, 3, 5, 9]
-    #               │  │  │  │
-    #               │  │  │  └─ end of seq3 (position 9)
-    #               │  │  └──── end of seq2 (position 5)
-    #               │  └─────── end of seq1 (position 3)
-    #               └────────── start (position 0)
     def prepare_prefill(self, seqs: list[Sequence]) -> torch.Tensor:
-        # length: sum of all input_ids after prefix cache
+        """Build concatenated prefill tensors and attention context.
+
+        Prefix-cached tokens are omitted from input_ids and slot_mapping, but
+        their block tables are still provided so attention can read cached keys
+        and values as prefix context.
+        """
+        # Tokens that still need a model forward pass after prefix-cache skips.
         input_ids = []
-        # length: sum of all input_ids after prefix cache
+        # Physical cache slots where each new token's K/V should be written.
         slot_mappings = []
-        # length: num_seqs
+        # Query lengths after removing cached prefix tokens.
         seqlens_q = []
-        # length: num_seqs
+        # Key lengths are full sequence lengths, including cached prefix tokens.
         seqlens_k = []
-        # length: num_seqs + 1
+        # Prefix sums delimit each sequence in the concatenated query tensor.
         cu_seqlens_q = [0]
-        # length: num_seqs + 1
+        # Prefix sums delimit each sequence's full key/value length.
         cu_seqlens_k = [0]
-        # block_tables: num_seqs x num_blocks (padded)
+        # Padded physical block ids for reading cached prefix blocks.
         block_tables = []
         for seq in seqs:
             token_ids = seq.token_ids
             num_cached_tokens = seq.num_cached_tokens
+            # Skip cached prefix tokens in the actual input ids.
             input_ids.extend(token_ids[num_cached_tokens:])
             seqlens_q.append(len(token_ids) - num_cached_tokens)
             seqlens_k.append(len(token_ids))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlens_q[-1])
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlens_k[-1])
             if seq.block_table:
+                # Only uncached blocks need slot mappings because only those K/V
+                # values are written during this prefill.
                 for i, block_id in enumerate(seq.block_table[seq.num_cached_blocks:]):
                     if seq.num_cached_blocks + i != seq.num_blocks - 1:
+                        # Full block: write all block_size positions.
                         slot_mappings.extend(list(range(block_id * self.block_size, (block_id+1) * self.block_size)))
                     else:
+                        # Last block may be partial: write only real token slots.
                         slot_mappings.extend(list(range(block_id * self.block_size, block_id * self.block_size + seq.last_block_num_tokens)))
         if cu_seqlens_q[-1] < cu_seqlens_k[-1]:
-            # pad block_tables
+            # A smaller query length than key length means some prefix was cached.
+            # In that case attention needs block_tables to read the cached KV.
             all_block_tables = [seq.block_table for seq in seqs]
             max_num_blocks = max(len(bt) for bt in all_block_tables)
             for i, seq in enumerate(seqs):
+                # Pad with -1 so all rows have the same width for the kernel.
                 block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
                 block_tables.append(block_table)
+
+        # Use pinned CPU tensors plus non_blocking copies so host-to-device
+        # transfer can overlap with CUDA work when possible.
         input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
         slot_mapping_tensor = torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
 
+        # Store attention metadata in a process-global context consumed by model
+        # layers and Triton attention wrappers during this forward pass.
         set_context(
             is_prefill=True,
             cu_seqlens_q=torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
@@ -314,19 +346,24 @@ class ModelRunner:
         return input_ids
 
 
-    # prepare input data for decoding
     def prepare_decode(self, seqs: list[Sequence]) -> torch.Tensor:
+        """Build one-token decode tensors and paged-attention context."""
         input_ids = []
         context_lens = []   
         slot_mappings = []  
         block_tables = []
         for seq in seqs:
+            # Decode feeds only the last token.  Everything before it is read
+            # from the sequence's KV-cache blocks.
             input_ids.append(seq.last_token)
             context_lens.append(len(seq))
+            # The new token's K/V is stored at the tail slot of the last block.
             slot_mappings.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
         all_block_tables = [seq.block_table for seq in seqs]
         max_num_blocks = max(len(bt) for bt in all_block_tables)
         for i, seq in enumerate(seqs):
+            # Pad rows so the decode kernel can index block_tables as a dense
+            # matrix: (batch_size, max_num_blocks).
             block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
             block_tables.append(block_table)
         input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
@@ -342,90 +379,96 @@ class ModelRunner:
         )
         return input_ids    
 
-    # prepare the temperature
     def prepare_sample(self, seqs: list[Sequence]) -> None:
+        """Collect per-sequence temperatures on the active CUDA device."""
         return torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
 
-    # when prefilling, directly compute model forward + logits
-    # when decoding, use cuda graph execution to speed up
-    # allocate input_ids, positions, slot_mapping, context_lens, block_tables, outputs
-    # into graph_variable, and then replay the graph
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, is_prefill: bool) -> torch.Tensor:
+        """Run the model either eagerly or through a captured decode graph."""
         if is_prefill or self.enforce_eager:
-            # For varlen prefill, keep input_ids as 1D (concatenated tokens)
-            # Do NOT unsqueeze - flash_attn_varlen_func expects 1D input with cu_seqlens
+            # Prefill is variable-length and usually has changing token counts,
+            # so it runs eagerly with a 1D concatenated token tensor.
             hidden_states = self.model(input_ids)
             logits = self.model.compute_logits(hidden_states)
         else:
+            # Decode has one token per sequence and can reuse a captured graph
+            # for the next bucketed batch size.
             bs = input_ids.size(0)
             context = get_context()
 
-            # finds smallest captured graph that fits the batch size
+            # Pick the smallest captured batch size that can hold this decode
+            # batch.  The unused tail rows remain ignored after replay.
             graph = self.graphs[next(bs_ for bs_ in self.graphs.keys() if bs_ >= bs)]
             vars = self.graph_vars
-            # copy input data into graph variables
+
+            # CUDA graphs require fixed memory addresses, so new decode metadata
+            # is copied into pre-allocated graph variables before replay.
             vars['input_ids'][:bs].copy_(input_ids)
             vars['slot_mapping'][:bs].fill_(-1)
             vars['slot_mapping'][:bs].copy_(context.slot_mapping)
             vars["context_lens"].zero_()
             vars['context_lens'][:bs].copy_(context.context_lens)
             vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            # replay the graph
+
             graph.replay()
             logits = self.model.compute_logits(vars['outputs'][:bs])
 
         return logits
 
 
-    # prepare prefill
-    # prepare sample
-    # run model
-    # sample logits
-    # reset context
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        """Prepare inputs, execute the model, sample tokens, and reset context."""
         if is_prefill:
             input_ids = self.prepare_prefill(seqs)
         else:
             input_ids = self.prepare_decode(seqs)
         logits = self.run_model(input_ids, is_prefill)
-        # only sample when rank == 0
+
+        # Only rank 0 needs sampled token ids for scheduler.postprocess.  Other
+        # ranks still run the model so tensor-parallel collectives stay aligned.
         token_ids = None
         if self.rank == 0:
             token_ids = self.sampler(logits, self.prepare_sample(seqs))
+
+        # The global context is per-forward metadata; clear it to avoid accidental
+        # reuse by the next batch.
         reset_context()
         return token_ids
 
-    # capture the CUDA graph:
-    # pre-allocation at maximum sizes: allocated onece and reuse for all graphs
-    # capture for different common batch sizes: [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
-    # with torch.cuda.graph(graph, self.graph_pool):
-    #        run model() and exact sequence of CUDA kernels for running self.model() will be captured
-    # (later use graph.replay() to run the captured graph)
     @torch.inference_mode()
     def capture_cudagraph(self) -> None:
+        """Capture decode graphs for common batch sizes.
+
+        Captured graphs replay the same CUDA kernel sequence with new data copied
+        into stable input buffers.  This removes Python overhead from decode,
+        where each step is small and latency-sensitive.
+        """
         max_bs = self.config['max_num_seqs']
         max_len = self.config['max_model_length']
         max_num_blocks = math.ceil(max_len / self.block_size)
-        # for decoding, input is always of shape (batch_size, 1)
+
+        # Decode input is one token id per sequence.
         input_ids = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
-        # for paged attention
-        # where to write new KV values in the cache
+        # Where each new token writes K/V into the physical cache.
         slot_mapping = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
-        # how many tokens each sequence has processed
+        # Full context length for each sequence, including the current token.
         context_lens = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
-        # where to read KV values in the cache
+        # Logical-to-physical block ids for each sequence.
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=f'cuda:{self.rank}')
-        # output logits
+        # Graph output buffer reused by every replay.
         outputs = torch.zeros(max_bs, self.config['vocab_size'], device=f'cuda:{self.rank}')
 
-        # graphs to be captured for different batch sizes
+        # Small powers of two and then multiples of sixteen cover common decode
+        # batch sizes while keeping capture count modest.
         batch_sizes = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         graph_pool = None
 
         for batch_size in reversed(batch_sizes):
             graph = torch.cuda.CUDAGraph()
+            # Bind the context to slices of the static graph buffers for this
+            # capture size.
             set_context(
                 is_prefill=False,
                 cu_seqlens_q=None,
@@ -436,19 +479,25 @@ class ModelRunner:
                 context_lens=context_lens[:batch_size],
                 block_tables=block_tables[:batch_size],
             )
+
+            # One eager warmup run materializes any lazy kernels before capture.
             outputs[:batch_size] = self.model(input_ids[:batch_size])
 
             with torch.cuda.graph(graph, graph_pool):
                 outputs[:batch_size] = self.model(input_ids[:batch_size])
                 if graph_pool is None:
+                    # Share the graph memory pool across captures to reduce
+                    # extra allocation pressure.
                     graph_pool = graph.pool()
-            # store the captured graph
+
             self.graphs[batch_size] = graph
 
-            # make sure that the capture is done before resetting and next capture
+            # Synchronize before switching context for the next capture size.
             torch.cuda.synchronize()
             reset_context()
 
+        # Keep references to the static buffers.  Releasing them would invalidate
+        # the memory addresses recorded inside the CUDA graphs.
         self.graph_vars = dict(
             input_ids=input_ids,
             slot_mapping=slot_mapping,

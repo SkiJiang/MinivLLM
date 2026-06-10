@@ -1,44 +1,42 @@
+"""Rotary positional embeddings for attention Q/K tensors."""
+
 import torch.nn as nn
 import torch 
 
 def apply_rotary_pos_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    # Handle both 3D varlen (total_tokens, num_heads, head_dim) and 4D batched (B, seq_len, num_heads, head_dim)
+    """Apply RoPE rotation to either varlen or batched attention tensors."""
+    # The project uses 3D tensors for concatenated variable-length prefill and
+    # 4D tensors for batched shapes.  Both layouts keep head_dim at the end.
     if x.dim() == 3:
-        # Varlen mode: (total_tokens, num_heads, head_dim)
+        # Varlen mode: (total_tokens, num_heads, head_dim).
         total_tokens, num_heads, head_dim = x.shape
-        # cos, sin shape: (total_tokens, head_dim/2)
-        # Expand to (total_tokens, 1, head_dim/2) for broadcasting
+        # Expand cos/sin across the head dimension.
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
 
-        # Split x into two halves along the head dimension
+        # RoPE treats the hidden dimension as two halves that form rotation pairs.
         x1, x2 = x.chunk(2, dim=-1)
 
-        # Apply rotary embedding
-        # x1, x2 shape: (total_tokens, num_heads, head_dim/2)
-        # cos, sin shape: (total_tokens, 1, head_dim/2)
+        # [x1, x2] rotated by angle theta:
+        # out1 = x1*cos - x2*sin, out2 = x1*sin + x2*cos.
         out1 = x1 * cos - x2 * sin
         out2 = x1 * sin + x2 * cos
 
         return torch.cat([out1, out2], dim=-1)
     else:
-        # Batched mode: (B, seq_len, num_heads, head_dim)
+        # Batched mode: (B, seq_len, num_heads, head_dim).
         B = x.size(0)
         seq_len = x.size(1)
         num_heads = x.size(2)
         head_dim = x.size(-1)
 
-        # Expand cos and sin to match the batch and head dimensions
-        # cos, sin shape: (seq_len, head_dim/2) -> (1, seq_len, 1, head_dim/2)
+        # Expand cos/sin across batch and head dimensions.
         cos = cos.unsqueeze(0).unsqueeze(2)
         sin = sin.unsqueeze(0).unsqueeze(2)
 
-        # Split x into two halves along the head dimension
         x1, x2 = x.chunk(2, dim=-1)
 
-        # Apply rotary embedding with proper broadcasting
-        # x1, x2 shape: (B, seq_len, num_heads, head_dim/2)
-        # cos, sin shape: (1, seq_len, 1, head_dim/2)
+        # The same rotation formula broadcasts over B and num_heads.
         out1 = x1 * cos - x2 * sin
         out2 = x1 * sin + x2 * cos
 
@@ -46,6 +44,8 @@ def apply_rotary_pos_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) 
 
 
 class RotaryEmbedding(nn.Module):
+    """Precompute and serve cosine/sine RoPE tables."""
+
     def __init__(
         self, 
         base:int,
@@ -59,26 +59,35 @@ class RotaryEmbedding(nn.Module):
         llama3_rope_original_max_position_embeddings: int = 8192,
     ):
         super().__init__()
+        # base controls the frequency ladder.  Larger values make rotations vary
+        # more slowly across positions and support longer contexts.
         self.base = base
-        # how many dimensions to apply rotary embedding
+        # Only the first rotary_embedding dimensions of each head are rotated.
         self.rotary_embedding = rotary_embedding
-        # max position that the long context can reach
+        # The cache must cover the largest position index used by generation.
         self.max_position = max_position
+
+        # inv_freq[j] = 1 / base^(2j / rotary_dim).  Each pair of hidden dims
+        # receives a different angular frequency.
         self.inv_freq = 1/(base ** (torch.arange(0, self.rotary_embedding, 2)/self.rotary_embedding))
 
         if is_llama3:
-            # specifically for llama3.2
+            # Llama 3.x rescales low-frequency RoPE components to extend context
+            # length while preserving high-frequency behavior.
             import math
             inv_freq = self.inv_freq
-            # no smooth if low_freq_factor == high_freq_factor
             wave_len = 2 * math.pi / inv_freq
             if llama3_rope_low_freq_factor == llama3_rope_high_freq_factor:
+                # Hard cutoff: frequencies with long wavelengths are divided by
+                # factor, shorter wavelengths remain unchanged.
                 inv_freq = torch.where(
                     wave_len < llama3_rope_original_max_position_embeddings / llama3_rope_high_freq_factor,
                     inv_freq,
                     inv_freq / llama3_rope_factor,
                 )
             else:
+                # Smoothly interpolate between unchanged and scaled frequencies
+                # across the configured wavelength band.
                 delta = llama3_rope_high_freq_factor - llama3_rope_low_freq_factor
                 smooth = (llama3_rope_original_max_position_embeddings / wave_len - llama3_rope_low_freq_factor) / delta
                 smooth = torch.clamp(smooth, 0, 1)
@@ -86,22 +95,25 @@ class RotaryEmbedding(nn.Module):
                 inv_freq = factor * inv_freq
             self.inv_freq = inv_freq
 
+        # positions is [0, 1, ..., max_position-1].  freqs[p, j] is the angle
+        # for position p and frequency j.
         positions = torch.arange(self.max_position).float()
-        # (max_position, rotary_embedding/2)
         freqs = torch.einsum("i,j -> ij", positions, self.inv_freq)
 
         cos = torch.cos(freqs)
         sin = torch.sin(freqs)
 
-        # (max_position, rotary_embedding)
+        # Store cos and sin together so forward() performs one indexed gather.
         cos_sin_cache = torch.cat([cos, sin], dim=-1)
+        # Buffers move with the module across devices but are not trainable.
         self.register_buffer("cos_sin_cache", cos_sin_cache)
 
     @torch.compile
-    # tell the position index of the token
-    # apply rotary embedding to query and key
     def forward(self, positions, query, key):
-        cos_sin = self.cos_sin_cache[positions]  # (seq_len, rotary_embedding)
+        """Rotate query and key tensors at the provided token positions."""
+        # positions may be one index per token in varlen prefill or one index per
+        # sequence in decode.
+        cos_sin = self.cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
         return (
             apply_rotary_pos_emb(query, cos, sin),
@@ -110,10 +122,9 @@ class RotaryEmbedding(nn.Module):
 
 
 if __name__ == "__main__":
+    # Small arithmetic probe for checking the frequency table construction.
     base = 5
-    # how many dimensions to apply rotary embedding
     rotary_dim = 16
-    # maximum position that the long context can reach
     max_position = 100
     print(torch.arange(0, rotary_dim, 2))
     print(base ** (torch.arange(0, rotary_dim, 2) / rotary_dim))
