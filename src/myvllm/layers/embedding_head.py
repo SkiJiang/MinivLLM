@@ -1,4 +1,4 @@
-"""Tensor-parallel token embedding and language-model head layers."""
+"""张量并行 token embedding 和语言模型输出 head 层。"""
 
 import torch
 from torch import nn
@@ -9,10 +9,10 @@ from myvllm.utils import get_context
 
 
 class VocabParallelEmbedding(nn.Module):
-    """Embedding table sharded over vocabulary ids.
+    """按词表 id 维度切分的 embedding 表。
 
-    Each rank owns a contiguous slice of token ids.  During forward, out-of-rank
-    ids are masked to zero locally, then all ranks sum their partial embeddings.
+    每个 rank 拥有一段连续 token id。forward 时，不属于当前 rank 的 id 会在本地被
+    mask 成 0，然后所有 rank 对局部 embedding 求和，得到完整 embedding。
     """
 
     def __init__(self, num_embeddings: int, embedding_dim: int):
@@ -20,85 +20,82 @@ class VocabParallelEmbedding(nn.Module):
         self.tp_size = dist.get_world_size()
         self.tp_rank = dist.get_rank()
 
-        # Keep the original vocabulary size for trimming and range checks.
+        # 保留原始词表大小，用于 logits 截断和 token 范围检查。
         self.num_embeddings = num_embeddings
-        # Pad the global vocab so every rank owns the same number of rows.
+        # 将全局词表 padding 到能被 tp_size 整除，使每个 rank 拥有相同行数。
         self.padded_num_embeddings = (num_embeddings + self.tp_size - 1) // self.tp_size * self.tp_size
-        # Number of embedding rows allocated on this rank.
+        # 当前 rank 分配到的 embedding 行数。
         self.num_embeddings_per_partition = self.padded_num_embeddings // self.tp_size
         self.embedding_dim = embedding_dim
 
-        # The parameter shape is local-vocab x hidden-size.
+        # 参数形状是 local_vocab x hidden_size。
         self.weight = nn.Parameter(torch.empty(self.num_embeddings_per_partition, embedding_dim))
-        # Custom loaders know how to copy only this rank's shard from a full
-        # checkpoint tensor.
+        # 自定义 loader 知道如何从完整 checkpoint tensor 中只拷贝当前 rank 的分片。
         self.weight.weight_loader = self.weight_loader
 
     def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor):
-        """Load this rank's vocabulary shard from full embedding weights."""
+        """从完整 embedding 权重中加载当前 rank 的词表分片。"""
         param_data = param.data
 
-        # Global row range assigned to this rank after padding.
+        # padding 后分配给当前 rank 的全局行范围。
         offset = self.tp_rank * self.num_embeddings_per_partition
         shard_size = self.num_embeddings_per_partition
 
-        # Some of the padded range may sit beyond the real vocabulary.
+        # padding 后的范围可能有一部分超出真实词表。
         actual_start = min(offset, self.num_embeddings)
         actual_end = min(offset + shard_size, self.num_embeddings)
         actual_size = max(0, actual_end - actual_start)
 
         if actual_size > 0:
-            # Copy only real rows from the checkpoint.
+            # 只从 checkpoint 拷贝真实存在的行。
             sharded_weights = loaded_weights.narrow(0, actual_start, actual_size)
             param_data[:actual_size].copy_(sharded_weights)
 
-        # Padded rows should never contribute logits/embeddings.
+        # padding 行不应贡献 logits 或 embedding。
         if actual_size < shard_size:
             param_data[actual_size:].zero_()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Look up embeddings with vocabulary-parallel masking."""
-        # mask identifies token ids that belong to this rank and are not padding.
+        """带词表并行 mask 的 embedding 查询。"""
+        # mask 标识哪些 token id 属于当前 rank，并且不是 padding 区域。
         mask = (x >= self.tp_rank * self.num_embeddings_per_partition) & \
                (x < (self.tp_rank + 1) * self.num_embeddings_per_partition) & \
                (x < self.num_embeddings)
-        # Convert global token ids into this rank's local row indices.  Masked
-        # entries become zero temporarily and are zeroed again after lookup.
+        # 将全局 token id 转换成当前 rank 的局部行下标。被 mask 的条目会暂时变成 0，
+        # 查询后还会再次清零。
         x = mask * (x - self.tp_rank * self.num_embeddings_per_partition)
         output = F.embedding(x, self.weight)
 
         if dist.get_world_size() > 1:
-            # Without this mask, out-of-rank token ids would contribute row 0's
-            # embedding from every non-owning rank.
+            # 如果没有这次 mask，不属于当前 rank 的 token 会错误贡献第 0 行 embedding。
             output = mask.unsqueeze(1) * output
-            # Sum partial embeddings; exactly one rank contributes a nonzero
-            # vector for each real token id.
+            # 对所有 rank 的局部 embedding 求和；每个真实 token id 只有一个 rank 贡献非零向量。
             dist.all_reduce(output, op=dist.ReduceOp.SUM)
         return output
 
 class ParallelLMHead(VocabParallelEmbedding):
-    """Vocabulary-parallel output projection, optionally tied to embeddings."""
+    """词表并行输出投影，可选地与 embedding 权重绑定。"""
 
     def __init__(self, num_embeddings: int, embedding_dim: int):
         super().__init__(num_embeddings, embedding_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Project hidden states to logits and gather vocabulary shards on rank 0."""
+        """将 hidden state 投影成 logits，并在 rank 0 汇聚词表分片。"""
         context = get_context()
         if context.is_prefill:
-            # During prefill we only need logits for each sequence's last prompt
-            # token; earlier prompt positions are not sampled.
-            last_token = context.cu_seqlens_q[1:] - 1  # exclude the first element which is 0
+            # prefill 阶段只需要每个序列最后一个 prompt token 的 logits；
+            # 更早位置不会被采样。
+            last_token = context.cu_seqlens_q[1:] - 1  # 排除第一个 0 元素
             x = x[last_token].contiguous()
 
-        # Local logits cover only this rank's vocabulary shard.
+        # 本地 logits 只覆盖当前 rank 的词表分片。
         logits = torch.nn.functional.linear(x, self.weight)
         if self.tp_size > 1:
-            # Only rank 0 needs the full logits for sampling.
+            # 只有 rank 0 需要完整 logits 来进行采样。
             all_logits = [torch.empty(logits.size(), device=logits.device) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
             dist.gather(logits, gather_list=all_logits, dst=0)
             if self.tp_rank == 0:
-                # Concatenate vocabulary shards and trim padded rows.
+                # 拼接词表分片，并去掉 padding 行。
                 logits = torch.cat(all_logits, dim=-1)
                 logits = logits[..., :self.num_embeddings]
 

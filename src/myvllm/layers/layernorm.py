@@ -1,28 +1,28 @@
-"""RMSNorm layer with optional fused residual add."""
+"""带可选残差相加融合路径的 RMSNorm 层。"""
 
 import torch
 import time 
 
 class LayerNorm(torch.nn.Module):
-    """Root-mean-square normalization used by Llama/Qwen blocks."""
+    """Llama/Qwen block 中使用的均方根归一化层。"""
 
     def __init__(self, gamma: torch.Tensor, eps: float = 1e-5):
         super().__init__()
-        # Store gamma as a parameter so checkpoint loading can copy directly into
-        # the model and optimizers would see it if training were added later.
+        # 将 gamma 保存为 parameter，使 checkpoint 加载可以直接拷贝；
+        # 如果后续加入训练，optimizer 也能看到它。
         self.weight = torch.nn.Parameter(gamma.detach().clone())
-        # eps prevents division by zero when the hidden state is near all zeros.
+        # hidden state 接近全 0 时，eps 可以避免除零。
         self.eps = eps
 
     @property
     def gamma(self):
-        """Backward compatibility alias for callers that still use gamma."""
+        """向后兼容别名：给仍然使用 gamma 的调用方使用。"""
         return self.weight
 
     @torch.compile
     def rms_forward(self, x: torch.Tensor) -> torch.Tensor:
-        # RMSNorm normalizes each token independently across the last dimension:
-        # x / sqrt(mean(x^2) + eps), then scales by the learned weight.
+        # RMSNorm 会沿最后一维独立归一化每个 token：
+        # x / sqrt(mean(x^2) + eps)，再乘以可学习的 weight。
         variance = x.pow(2).mean(dim=-1, keepdim=True) + self.eps
         sqrt_variance = variance.sqrt()
         x_norm = (x / sqrt_variance * self.weight)
@@ -30,21 +30,20 @@ class LayerNorm(torch.nn.Module):
         return x_norm
 
     def residual_rms_forward(self, x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
-        # Transformer blocks commonly add the previous residual before applying
-        # the next normalization.  Return both normalized x and updated residual
-        # so the caller can reuse the residual in the next block.
+        # Transformer block 通常会先加上上一条 residual，再做下一次归一化。
+        # 这里同时返回归一化后的 x 和更新后的 residual，方便下一层继续复用。
         x = x + residual
         return self.rms_forward(x), x
 
     def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
-        # If residual is omitted, this behaves like a plain RMSNorm layer.
+        # 如果没有传 residual，这个层就退化成普通 RMSNorm。
         if residual is not None:
             return self.residual_rms_forward(x, residual)
         else:
             return self.rms_forward(x)
 
 if __name__ == "__main__":
-    # Local microbenchmark for standalone and residual-fused RMSNorm.
+    # 本地微基准：分别测试普通 RMSNorm 和融合 residual 的 RMSNorm。
     x = torch.randn(8,4000,8000).cuda()
     gamma = torch.full((8000,), 0.5, device="cuda", dtype=x.dtype)
     layer = LayerNorm(gamma=gamma).cuda()

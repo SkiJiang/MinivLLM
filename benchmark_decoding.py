@@ -1,4 +1,4 @@
-"""Paged-attention decode benchmark for PyTorch and Triton implementations."""
+"""PyTorch 和 Triton 实现的 paged-attention decode benchmark。"""
 
 import torch
 import time
@@ -21,38 +21,38 @@ def paged_attention_decode_kernel(
     max_num_blocks: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """Compute one decode attention output per batch item and query head."""
-    # Grid axes: batch index and query head index.
+    """为每个 batch item 和 query head 计算一个 decode attention 输出。"""
+    # Grid 轴：batch 下标和 query head 下标。
     batch_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
     
-    # GQA maps several query heads to one KV head.
+    # GQA 会把多个 query head 映射到一个 KV head。
     kv_head_idx = head_idx // (num_heads // num_kv_heads)
-    # Number of valid tokens in this sequence's KV history.
+    # 当前序列 KV 历史中的有效 token 数。
     context_len = tl.load(context_lens_ptr + batch_idx)
     
-    # Load the current query vector.
+    # 读取当前 query 向量。
     offs_d = tl.arange(0, head_dim)
     q_offset = batch_idx * num_heads * head_dim + head_idx * head_dim + offs_d
     q = tl.load(query_ptr + q_offset)
     
-    # Online softmax state for the single query.
+    # 单个 query 的 online softmax 状态。
     acc = tl.zeros([head_dim], dtype=tl.float32)
     l_i = 0.0
     m_i = -1e10
     
-    # Iterate over all possible cache tokens in fixed-size chunks.
+    # 以固定大小 chunk 遍历所有可能的 cache token。
     max_chunks = tl.cdiv(max_num_blocks * block_size, BLOCK_N)
     
     for chunk_idx in range(max_chunks):
-        # token_start is a logical token position, not a physical cache offset.
+        # token_start 是逻辑 token 位置，不是物理 cache offset。
         token_start = chunk_idx * BLOCK_N
         
         if token_start < context_len:
             offs_n = token_start + tl.arange(0, BLOCK_N)
             mask_n = offs_n < context_len
             
-            # Fill attention scores for this chunk by following block_tables.
+            # 根据 block_tables 为当前 chunk 填充 attention score。
             qk = tl.zeros([BLOCK_N], dtype=tl.float32) - 1e10
             
             for i in range(BLOCK_N):
@@ -62,12 +62,12 @@ def paged_attention_decode_kernel(
                     block_offset = token_idx % block_size
                     
                     if block_num < max_num_blocks:
-                        # block_tables maps logical blocks to physical cache blocks.
+                        # block_tables 将逻辑 block 映射到物理 cache block。
                         block_table_offset = batch_idx * max_num_blocks + block_num
                         physical_block_idx = tl.load(block_tables_ptr + block_table_offset)
                         
                         if physical_block_idx != -1:
-                            # Load K from (num_blocks, block_size, num_kv_heads, head_dim).
+                            # 从 (num_blocks, block_size, num_kv_heads, head_dim) 中读取 K。
                             k_offset = (physical_block_idx * block_size * num_kv_heads * head_dim +
                                        block_offset * num_kv_heads * head_dim +
                                        kv_head_idx * head_dim + offs_d)
@@ -77,10 +77,10 @@ def paged_attention_decode_kernel(
                             mask_i = tl.arange(0, BLOCK_N) == i
                             qk = tl.where(mask_i, score, qk)
             
-            # Invalid chunk entries should not affect softmax.
+            # 无效 chunk 条目不应影响 softmax。
             qk = tl.where(mask_n, qk, -1e10)
             
-            # Numerically stable online softmax update.
+            # 数值稳定的 online softmax 更新。
             m_ij = tl.max(qk)
             m_i_new = tl.maximum(m_i, m_ij)
             alpha = tl.exp(m_i - m_i_new)
@@ -89,7 +89,7 @@ def paged_attention_decode_kernel(
             acc = acc * alpha
             l_i = l_i * alpha
             
-            # Accumulate weighted V vectors from the same physical cache blocks.
+            # 从同一批物理 cache block 累加加权后的 V 向量。
             for i in range(BLOCK_N):
                 token_idx = token_start + i
                 if token_idx < context_len:
@@ -101,13 +101,13 @@ def paged_attention_decode_kernel(
                         physical_block_idx = tl.load(block_tables_ptr + block_table_offset)
                         
                         if physical_block_idx != -1:
-                            # Load V from the paged cache.
+                            # 从 paged cache 中读取 V。
                             v_offset = (physical_block_idx * block_size * num_kv_heads * head_dim +
                                        block_offset * num_kv_heads * head_dim +
                                        kv_head_idx * head_dim + offs_d)
                             v_vec = tl.load(v_cache_ptr + v_offset)
                             
-                            # Extract scalar p[i] with a one-hot mask.
+                            # 使用 one-hot mask 提取标量 p[i]。
                             mask_i = tl.arange(0, BLOCK_N) == i
                             weight = tl.sum(tl.where(mask_i, p, 0.0))
                             
@@ -116,7 +116,7 @@ def paged_attention_decode_kernel(
             
             m_i = m_i_new
     
-    # Store the normalized output vector.
+    # 写回归一化后的输出向量。
     output = acc / l_i
     output_offset = batch_idx * num_heads * head_dim + head_idx * head_dim + offs_d
     tl.store(output_ptr + output_offset, output)
@@ -134,16 +134,16 @@ def paged_attention_decode_triton(
     head_dim: int,
     block_size: int
 ) -> torch.Tensor:
-    """Launch the Triton paged-attention decode kernel."""
+    """启动 Triton paged-attention decode kernel。"""
     batch_size = query.shape[0]
     max_num_blocks = block_tables.shape[1]
-    # Kernel pointer arithmetic assumes contiguous query storage.
+    # kernel 指针算术假设 query 是连续存储。
     query = query.contiguous()
     output = torch.empty_like(query)
     
-    # Wider heads use smaller chunks to keep register/shared-memory pressure down.
+    # head 越宽，使用越小的 chunk，以降低寄存器/共享内存压力。
     BLOCK_N = 64 if head_dim <= 128 else 32
-    # One program per batch item and query head.
+    # 每个 batch item 和 query head 对应一个 program。
     grid = (batch_size, num_heads)
     
     paged_attention_decode_kernel[grid](
@@ -167,19 +167,19 @@ def decode_torch_optimized(
     head_dim: int,
     block_size: int,
 ) -> torch.Tensor:
-    """Vectorized PyTorch baseline that first gathers paged cache into dense tensors."""
+    """向量化 PyTorch 基线：先把 paged cache gather 成稠密 tensor。"""
     batch_size = q.shape[0]
     device = q.device
     dtype = q.dtype
     
     max_context_len = context_lens.max().item()
     
-    # Dense padded buffers make PyTorch matmul simple but add gather/copy overhead.
+    # 稠密 padding buffer 让 PyTorch matmul 更简单，但会增加 gather/copy 开销。
     padded_k = torch.zeros(batch_size, max_context_len, num_kv_heads, head_dim, device=device, dtype=dtype)
     padded_v = torch.zeros(batch_size, max_context_len, num_kv_heads, head_dim, device=device, dtype=dtype)
     
     for i in range(batch_size):
-        # Follow the block table and truncate the final block to seq_len.
+        # 按 block table 读取，并将最后一个 block 截断到 seq_len。
         seq_len = context_lens[i].item()
         num_blocks_needed = (seq_len + block_size - 1) // block_size
         
@@ -194,7 +194,7 @@ def decode_torch_optimized(
             padded_v[i, :seq_len] = gathered_v
     
     if num_kv_heads != num_heads:
-        # Expand grouped KV heads so standard attention can use one KV head per Q.
+        # 扩展 grouped KV head，使标准 attention 能做到每个 Q head 一个 KV head。
         num_groups = num_heads // num_kv_heads
         padded_k = padded_k.repeat_interleave(num_groups, dim=2)
         padded_v = padded_v.repeat_interleave(num_groups, dim=2)
@@ -203,10 +203,10 @@ def decode_torch_optimized(
     padded_k = padded_k.transpose(1, 2)
     padded_v = padded_v.transpose(1, 2)
     
-    # q attends to the full padded context for each sequence.
+    # q 会关注每个序列的完整 padded context。
     attn_scores = torch.matmul(q, padded_k.transpose(-2, -1)) * scale
     
-    # Mask out padding beyond each sequence length.
+    # mask 掉每个序列长度之外的 padding。
     mask = torch.arange(max_context_len, device=device)[None, :] < context_lens[:, None]
     mask = mask[:, None, None, :]
     attn_scores = attn_scores.masked_fill(~mask, float('-inf'))
@@ -230,8 +230,8 @@ def naive_decode_attention(
     block_size: int,
 ) -> torch.Tensor:
     """
-    Naive decode implementation
-    This reconstructs full K, V sequences and uses standard PyTorch attention.
+    朴素 decode 实现。
+    它会重建完整 K/V 序列，并使用标准 PyTorch attention。
     """
     batch_size = q.shape[0]
     device = q.device
@@ -239,7 +239,7 @@ def naive_decode_attention(
     
     max_context_len = context_lens.max().item()
     
-    # Gather K/V into Python lists first, which is intentionally simple but slow.
+    # 先把 K/V gather 到 Python list 中；这种写法故意简单，但速度较慢。
     all_k = []
     all_v = []
     
@@ -262,7 +262,7 @@ def naive_decode_attention(
             all_k.append(seq_k)
             all_v.append(seq_v)
     
-    # Pad variable-length gathered K/V into dense tensors for batch matmul.
+    # 将 gather 出来的变长 K/V padding 成稠密 tensor，以便 batch matmul。
     padded_k = torch.zeros(batch_size, max_context_len, num_kv_heads, head_dim,
                            device=device, dtype=dtype)
     padded_v = torch.zeros(batch_size, max_context_len, num_kv_heads, head_dim,
@@ -274,17 +274,17 @@ def naive_decode_attention(
         padded_v[i, :seq_len] = v_seq
     
     if num_kv_heads != num_heads:
-        # Repeat KV heads to match query-head count for a standard attention call.
+        # 重复 KV head，使其匹配标准 attention 调用需要的 query-head 数。
         num_groups = num_heads // num_kv_heads
         padded_k = padded_k.repeat_interleave(num_groups, dim=2)
         padded_v = padded_v.repeat_interleave(num_groups, dim=2)
     
-    # Reshape to (B, H, 1, D) x (B, H, D, N).
+    # reshape 成 (B, H, 1, D) x (B, H, D, N)。
     q = q.unsqueeze(2)  # (B, H, 1, D)
     padded_k = padded_k.transpose(1, 2)  # (B, H, N, D)
     padded_v = padded_v.transpose(1, 2)  # (B, H, N, D)
     
-    # Materializes the full attention score vector for every batch/head.
+    # 为每个 batch/head 物化完整 attention score 向量。
     attn_scores = torch.matmul(q, padded_k.transpose(-2, -1)) * scale
     
     mask = torch.arange(max_context_len, device=device)[None, :] < context_lens[:, None]
@@ -299,25 +299,25 @@ def naive_decode_attention(
 
 
 def setup_test_data(batch_size, seq_len, num_heads, num_kv_heads, head_dim, block_size, device='cuda'):
-    """Setup test data for benchmarking"""
-    # Query represents the current decode token for each sequence.
+    """构造 benchmark 使用的测试数据。"""
+    # query 表示每个序列当前 decode token。
     q = torch.randn(batch_size, num_heads, head_dim, device=device, dtype=torch.float16)
     
-    # Allocate enough physical blocks for every sequence's full context.
+    # 为每个序列的完整 context 分配足够多的物理 block。
     max_num_blocks = (seq_len + block_size - 1) // block_size
     total_blocks = batch_size * max_num_blocks
     
-    # KV cache mimics ModelRunner's paged layout.
+    # KV cache 模拟 ModelRunner 的 paged 布局。
     k_cache = torch.randn(total_blocks, block_size, num_kv_heads, head_dim, device=device, dtype=torch.float16)
     v_cache = torch.randn(total_blocks, block_size, num_kv_heads, head_dim, device=device, dtype=torch.float16)
     
-    # Consecutive physical block ids make correctness inspection straightforward.
+    # 使用连续物理 block id，方便检查正确性。
     block_tables = torch.arange(total_blocks, device=device, dtype=torch.int32).reshape(batch_size, max_num_blocks)
     
-    # Benchmark uses equal sequence lengths for clearer timing.
+    # benchmark 使用相同序列长度，使计时更清楚。
     context_lens = torch.full((batch_size,), seq_len, device=device, dtype=torch.int32)
     
-    # Standard attention scale.
+    # 标准 attention scale。
     scale = 1.0 / (head_dim ** 0.5)
     
     return q, k_cache, v_cache, block_tables, context_lens, scale
@@ -325,23 +325,23 @@ def setup_test_data(batch_size, seq_len, num_heads, num_kv_heads, head_dim, bloc
 
 def benchmark(batch_size, seq_len, num_heads=32, num_kv_heads=8, 
                                   head_dim=128, block_size=16, num_iterations=100):
-    """Compare all three implementations"""
+    """比较三个实现。"""
     
     print(f"\n{'='*70}")
     print(f"batch_size={batch_size}, seq_len={seq_len}, num_heads={num_heads}")
     print(f"num_kv_heads={num_kv_heads}, head_dim={head_dim}, block_size={block_size}")
     print(f"{'='*70}")
     
-    # Synthetic data isolates attention kernel performance from model overhead.
+    # 合成数据可以隔离 attention kernel 性能，不混入模型其他开销。
     q, k_cache, v_cache, block_tables, context_lens, scale = setup_test_data(
         batch_size, seq_len, num_heads, num_kv_heads, head_dim, block_size
     )
     
     results = {}
     
-    # 1. Naive implementation.
+    # 1. 朴素实现。
     print("\n1. Testing Naive PyTorch implementation...")
-    for _ in range(10):  # warmup
+    for _ in range(10):  # 预热
         _ = naive_decode_attention(q, k_cache, v_cache, block_tables, context_lens,
                                    scale, num_heads, num_kv_heads, head_dim, block_size)
     
@@ -355,9 +355,9 @@ def benchmark(batch_size, seq_len, num_heads=32, num_kv_heads=8,
     results['Naive PyTorch'] = naive_time
     print(f"   Time: {naive_time*1000:.3f}ms")
     
-    # 2. Optimized PyTorch baseline.
+    # 2. 优化版 PyTorch 基线。
     print("\n2. Testing Optimized PyTorch implementation...")
-    for _ in range(10):  # warmup
+    for _ in range(10):  # 预热
         _ = decode_torch_optimized(q, k_cache, v_cache, block_tables, context_lens,
                                    scale, num_heads, num_kv_heads, head_dim, block_size)
     
@@ -371,9 +371,9 @@ def benchmark(batch_size, seq_len, num_heads=32, num_kv_heads=8,
     results['Optimized PyTorch'] = pytorch_time
     print(f"   Time: {pytorch_time*1000:.3f}ms")
     
-    # 3. Triton paged attention kernel.
+    # 3. Triton paged attention kernel。
     print("\n3. Testing Triton implementation...")
-    for _ in range(10):  # warmup
+    for _ in range(10):  # 预热
         _ = paged_attention_decode_triton(q, k_cache, v_cache, block_tables, context_lens,
                                           scale, num_heads, num_kv_heads, head_dim, block_size)
     
@@ -391,7 +391,7 @@ def benchmark(batch_size, seq_len, num_heads=32, num_kv_heads=8,
 
 
 if __name__ == "__main__":
-    # Run a small sweep over context sizes and batch sizes.
+    # 对 context size 和 batch size 做一个小范围 sweep。
     print("\n" + "="*70)
     print("COMPREHENSIVE PAGED ATTENTION DECODE BENCHMARK")
     print("Comparing: Naive PyTorch | Optimized PyTorch | Triton")

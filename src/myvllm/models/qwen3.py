@@ -1,11 +1,11 @@
-"""Qwen3 model components built from the local tensor-parallel layers."""
+"""基于本项目张量并行层实现的 Qwen3 模型组件。"""
 
 from myvllm.layers import *
 import torch 
 import torch.nn as nn
 
 class Qwen3Attention(nn.Module):
-    """Qwen3 attention with fused QKV, optional Q/K norm, RoPE, and paged attention."""
+    """包含融合 QKV、可选 Q/K norm、RoPE 和 paged attention 的 Qwen3 attention。"""
 
     def __init__(
         self,
@@ -23,8 +23,7 @@ class Qwen3Attention(nn.Module):
         super().__init__()
         self.tp_size = dist.get_world_size()
 
-        # total_* values are global checkpoint counts; num_* values are local to
-        # the current tensor-parallel rank.
+        # total_* 是全局 checkpoint 中的数量；num_* 是当前张量并行 rank 本地的数量。
         self.total_num_heads = num_heads
         self.num_heads = num_heads // self.tp_size
 
@@ -34,9 +33,8 @@ class Qwen3Attention(nn.Module):
         self.head_dim = head_dim if head_dim is not None else hidden_size // num_heads
         self.scale = scale
 
-        # Fused QKV keeps three projections in one matrix multiply.  The custom
-        # weight loader copies q_proj/k_proj/v_proj checkpoint tensors into the
-        # correct packed slices.
+        # 融合 QKV 将三个投影合并为一次矩阵乘。自定义 weight loader 会把
+        # q_proj/k_proj/v_proj 的 checkpoint tensor 拷贝到正确的 packed 切片。
         self.qkv_projection = QKVColumnParallelLinear(
             input_size=hidden_size,
             head_size=head_dim,
@@ -44,23 +42,23 @@ class Qwen3Attention(nn.Module):
             num_kv_heads=self.total_num_kv_heads,
             bias=qkv_bias,
         )
-        # Per-rank packed output split sizes.
+        # 每个 rank 的 packed 输出拆分大小。
         self.q_size = head_dim * self.num_heads
         self.kv_size = head_dim * self.num_kv_heads
         self.qkv_bias = qkv_bias
 
-        # Qwen3 uses RMSNorm on Q and K when QKV projection has no bias.
+        # 当 QKV projection 没有 bias 时，Qwen3 会对 Q 和 K 使用 RMSNorm。
         self.q_norm = LayerNorm(torch.ones(head_dim))
         self.k_norm = LayerNorm(torch.ones(head_dim))
 
-        # Standard Qwen RoPE table.
+        # 标准 Qwen RoPE 表。
         self.rotary_emb = RotaryEmbedding(
             base=base,
             rotary_embedding=head_dim,
             max_position=max_position
         )
 
-        # Attention handles both prefill flash attention and decode paged attention.
+        # Attention 同时处理 prefill flash attention 和 decode paged attention。
         self.attention = Attention(
             self.num_heads,
             head_dim,
@@ -69,8 +67,7 @@ class Qwen3Attention(nn.Module):
             block_size
         )
 
-        # Output projection consumes local heads and all-reduces the full hidden
-        # state across ranks.
+        # 输出投影消费本地 head，并跨 rank all-reduce 得到完整 hidden state。
         self.o_proj = RowParallelLinear(
             input_size=head_dim * self.total_num_heads,
             output_size=hidden_size,
@@ -82,17 +79,17 @@ class Qwen3Attention(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        """Run the Qwen3 attention sublayer."""
-        # x is replicated before the column-parallel projection.
+        """运行 Qwen3 attention 子层。"""
+        # column-parallel 投影前，x 在各 rank 上是复制的。
 
-        # Projection output contains only this rank's heads.
+        # projection 输出只包含当前 rank 的 head。
         qkv = self.qkv_projection(x)
 
-        # Split packed local Q/K/V segments.
+        # 拆分本地 packed Q/K/V 片段。
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        # Prefill can be a 2D varlen tensor; decode graph capture can use a
-        # batched tensor.  Both expose (heads, head_dim) before attention.
+        # prefill 可以是 2D varlen tensor；decode graph capture 可以使用 batched tensor。
+        # 两者在 attention 前都会显式展开 (heads, head_dim)。
         if q.dim() == 2:
             q = q.view(-1, self.num_heads, self.head_dim)
             k = k.view(-1, self.num_kv_heads, self.head_dim)
@@ -103,26 +100,26 @@ class Qwen3Attention(nn.Module):
             k = k.view(B, N, self.num_kv_heads, self.head_dim)
             v = v.view(B, N, self.num_kv_heads, self.head_dim)
 
-        # Q/K normalization stabilizes dot-product magnitudes before softmax.
+        # Q/K normalization 会在 softmax 前稳定点积幅度。
         if self.qkv_bias is False:
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        # Kept import is harmless and useful for quick local diagnostics.
+        # 保留这个 import 不影响运行，也便于快速本地诊断。
         import sys
 
-        # RoPE adds positional phase to Q/K.
+        # RoPE 为 Q/K 加入位置相位信息。
         q, k = self.rotary_emb(positions, q, k) 
 
         o = self.attention(q, k, v)
 
-        # Row parallel output projection reconstructs hidden_size on every rank.
+        # row parallel 输出投影会在每个 rank 上重建 hidden_size。
         o = self.o_proj(o)
 
         return o
 
 class Qwen3MLP(nn.Module):
-    """Qwen3 feed-forward network with SwiGLU activation."""
+    """带 SwiGLU 激活的 Qwen3 前馈网络。"""
 
     def __init__(
         self,
@@ -131,14 +128,14 @@ class Qwen3MLP(nn.Module):
         bias: bool = True,
     ):
         super().__init__()
-        # Fused gate/up projection halves the number of matmul launches.
+        # 融合 gate/up 投影可以减少矩阵乘 launch 次数。
         self.gate_up = MergedColumnParallelLinear(
             input_size=hidden_size,
             output_sizes=[intermediate_size] * 2,
             bias=bias,
         )
         self.activation = SiluAndMul()
-        # Down projection sums partial intermediate features across ranks.
+        # down projection 会跨 rank 汇总部分 intermediate feature。
         self.down_proj = RowParallelLinear(
             input_size=intermediate_size,
             output_size=hidden_size,
@@ -146,13 +143,13 @@ class Qwen3MLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Run gate/up, activation, and down projection."""
+        """执行 gate/up、激活和 down projection。"""
         x = self.down_proj(self.activation(self.gate_up(x)))
         return x
 
 
 class Qwen3DecoderLayer(nn.Module):
-    """One Qwen3 decoder block with residual-carry RMSNorm."""
+    """一个带 residual 传递 RMSNorm 的 Qwen3 decoder block。"""
 
     def __init__(
         self,
@@ -170,7 +167,7 @@ class Qwen3DecoderLayer(nn.Module):
         block_size: int = 256,
     ):
         super().__init__()
-        # Gamma tensors are checkpoint-loadable RMSNorm weights.
+        # gamma tensor 是可以从 checkpoint 加载的 RMSNorm 权重。
         gamma = torch.ones(hidden_size)
         self.input_layernorm = LayerNorm(gamma)
         self.self_attn = Qwen3Attention(
@@ -193,16 +190,16 @@ class Qwen3DecoderLayer(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
-        """Apply attention and MLP sublayers with residual state."""
+        """带 residual 状态地执行 attention 和 MLP 子层。"""
         if residual is not None:
             x, residual = self.input_layernorm(x, residual)
         else:
-            # First layer starts the residual stream.
+            # 第一层开启 residual 流。
             residual = x
             x = self.input_layernorm(x)
 
-        # Packed prefill requires positions to restart for every sequence; decode
-        # uses each sequence's current length minus one.
+        # packed prefill 要求每个序列的 position 从 0 重新开始；
+        # decode 使用每个序列当前长度减一。
         from myvllm.utils import get_context
         context = get_context()
         if context.is_prefill and context.cu_seqlens_q is not None:
@@ -218,13 +215,13 @@ class Qwen3DecoderLayer(nn.Module):
             positions = context.context_lens - 1
 
         x = self.self_attn(x, positions=positions)
-        # post_attention_layernorm adds attention output to residual internally.
+        # post_attention_layernorm 内部会把 attention 输出加到 residual 上。
         x, residual = self.post_attention_layernorm(x, residual)
         x = self.mlp(x)
         return x, residual
 
 class Qwen3Model(nn.Module):
-    """Qwen3 transformer backbone without the LM head."""
+    """不包含 LM head 的 Qwen3 Transformer 主干。"""
 
     def __init__(
         self,
@@ -244,12 +241,12 @@ class Qwen3Model(nn.Module):
         block_size: int = 256,
     ):
         super().__init__()
-        # Vocab-parallel embedding returns a replicated hidden state after reduce.
+        # 词表并行 embedding 在 reduce 后返回复制到各 rank 的 hidden state。
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=vocab_size,
             embedding_dim = hidden_size
         )
-        # Decoder stack with identical per-forward context metadata.
+        # decoder 层堆叠，同一次 forward 中共享相同 context 元数据。
         self.layers = nn.ModuleList([
             Qwen3DecoderLayer(
                 hidden_size=hidden_size,
@@ -270,7 +267,7 @@ class Qwen3Model(nn.Module):
         self.norm = LayerNorm(gamma)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Run embeddings, decoder layers, and final RMSNorm."""
+        """执行 embedding、decoder 层和最终 RMSNorm。"""
         x = self.embed_tokens(input_ids)
         residual = None
         for layer in self.layers:
@@ -280,9 +277,9 @@ class Qwen3Model(nn.Module):
 
 
 class Qwen3ForCausalLM(nn.Module):
-    """Qwen3 backbone plus vocabulary projection for next-token logits."""
+    """Qwen3 主干加词表投影，用于得到 next-token logits。"""
 
-    # Mapping documents how checkpoint names correspond to fused local modules.
+    # 这个 mapping 记录 checkpoint 名称如何对应到本地融合模块。
     packed_module_mapping = {
         "q_proj": ('q_proj', 'q'),
         "k_proj": ('k_proj', 'k'),
@@ -309,7 +306,7 @@ class Qwen3ForCausalLM(nn.Module):
         block_size: int = 256,
     ):
         super().__init__()
-        # Infer head_dim from hidden_size/num_heads if the config omits it.
+        # 如果配置里没有 head_dim，就根据 hidden_size/num_heads 推导。
         head_dim = head_dim if head_dim is not None else hidden_size // num_heads
         self.model = Qwen3Model(
             vocab_size=vocab_size,
@@ -332,22 +329,21 @@ class Qwen3ForCausalLM(nn.Module):
             embedding_dim=hidden_size
         )
         if tie_word_embeddings:
-            # Tie output projection to token embedding when the model config
-            # expects shared weights.
+            # 当模型配置要求共享权重时，将输出投影绑定到 token embedding。
             self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Return hidden states; logits are computed separately for sampling."""
+        """返回 hidden state；logits 会在采样前单独计算。"""
         x = self.model(input_ids)
         return x 
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project hidden states to vocabulary logits."""
+        """将 hidden state 投影到词表 logits。"""
         logits = self.lm_head(hidden_states)
         return logits
 
 if __name__ == "__main__":
-    # Lightweight construction smoke test for the Qwen3 module stack.
+    # 轻量构造 smoke test：检查 Qwen3 模块栈是否能实例化。
     model = Qwen3ForCausalLM(
         vocab_size=50257,
         hidden_size=768,

@@ -1,4 +1,4 @@
-"""Llama model components built from the local tensor-parallel layers."""
+"""基于本项目张量并行层实现的 Llama 模型组件。"""
 
 from myvllm.layers import *
 
@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 class LlamaAttn(nn.Module):
-    """Llama self-attention block with fused QKV projection and RoPE."""
+    """带融合 QKV 投影和 RoPE 的 Llama self-attention block。"""
 
     def __init__(
         self,
@@ -25,8 +25,7 @@ class LlamaAttn(nn.Module):
         super().__init__()
         self.tp_size = dist.get_world_size()
 
-        # total_* values describe the checkpoint/global model.  num_* values
-        # describe this rank's local shard after tensor parallelism.
+        # total_* 表示 checkpoint/全局模型里的数量；num_* 表示张量并行后当前 rank 的本地分片数量。
         self.total_num_heads = num_qo_heads
         self.num_heads = num_qo_heads // self.tp_size
 
@@ -35,7 +34,7 @@ class LlamaAttn(nn.Module):
 
         self.head_dim = head_dim if head_dim is not None else hidden_size // num_qo_heads
 
-        # Fuses q_proj/k_proj/v_proj into one column-parallel matrix multiply.
+        # 将 q_proj/k_proj/v_proj 融合为一次 column-parallel 矩阵乘。
         self.qkv_projection = QKVColumnParallelLinear(
             input_size=hidden_size,
             head_size=head_dim,
@@ -44,11 +43,11 @@ class LlamaAttn(nn.Module):
             bias=has_attn_bias,
         )
 
-        # Local split sizes for the fused qkv output.
+        # 融合 qkv 输出在本地的拆分大小。
         self.q_size = head_dim * self.num_heads
         self.kv_size = head_dim * self.num_kv_heads
         
-        # Llama 3.x applies RoPE directly to Q/K and does not use Q/K RMSNorm.
+        # Llama 3.x 直接对 Q/K 应用 RoPE，不使用 Q/K RMSNorm。
         self.rotary_emb = RotaryEmbedding(
             base=rope_base,
             rotary_embedding=head_dim,
@@ -61,7 +60,7 @@ class LlamaAttn(nn.Module):
             num_kv_heads=num_kv_heads,
             block_size=block_size,
         )
-        # Row-parallel output projection reduces partial head outputs across ranks.
+        # row-parallel 输出投影会在多个 rank 间规约部分 head 输出。
         self.o_proj = RowParallelLinear(
             input_size= head_dim * num_qo_heads,
             output_size=hidden_size,
@@ -73,18 +72,17 @@ class LlamaAttn(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        """Apply one attention sublayer to normalized hidden states."""
-        # x is replicated across ranks before the column-parallel projection.
+        """对归一化后的 hidden state 应用一个 attention 子层。"""
+        # column-parallel 投影前，x 在各个 rank 上是复制的。
 
-        # Column parallelism shards output heads, so each rank receives only its
-        # local Q heads and local KV heads.
+        # column parallel 会切分输出 head，因此每个 rank 只得到自己的本地 Q head 和 KV head。
         qkv = self.qkv_projection(x)
 
-        # Split the packed local projection into Q, K, and V segments.
+        # 将本地 packed projection 拆成 Q、K、V 三段。
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        # Prefill uses a concatenated 2D varlen tensor; CUDA graph decode can use
-        # a batched tensor.  Both are reshaped to expose head dimension.
+        # prefill 使用拼接后的 2D varlen tensor；CUDA graph decode 可以使用 batched tensor。
+        # 两者都会 reshape 出 head 维度。
         if q.dim() == 2:
             q = q.view(-1, self.num_heads, self.head_dim)
             k = k.view(-1, self.num_kv_heads, self.head_dim)
@@ -95,19 +93,18 @@ class LlamaAttn(nn.Module):
             k = k.view(B, N, self.num_kv_heads, self.head_dim)
             v = v.view(B, N, self.num_kv_heads, self.head_dim)
 
-        # RoPE injects token position into Q/K before attention scores are formed.
+        # RoPE 在计算 attention score 前将 token 位置信息注入 Q/K。
         q, k = self.rotary_emb(positions, q, k) 
 
         o = self.attention(q, k, v)
 
-        # RowParallelLinear all-reduces partial projections so every rank receives
-        # the replicated hidden_size output.
+        # RowParallelLinear 会 all-reduce 部分投影结果，使每个 rank 都拿到复制后的 hidden_size 输出。
         o = self.o_proj(o)
 
         return o
     
 class LlamaMLP(nn.Module):
-    """Llama feed-forward network using fused gate/up projection."""
+    """使用融合 gate/up 投影的 Llama 前馈网络。"""
 
     def __init__(
         self,
@@ -116,15 +113,15 @@ class LlamaMLP(nn.Module):
         bias: bool = True,
     ):
         super().__init__()
-        # gate_up produces two intermediate vectors in one column-parallel matmul.
+        # gate_up 用一次 column-parallel matmul 生成两个 intermediate 向量。
         self.gate_up = MergedColumnParallelLinear(
             input_size=hidden_size,
             output_sizes=[intermediate_size] * 2,
             bias=bias,
         )
-        # SiluAndMul implements the SwiGLU nonlinearity over the packed output.
+        # SiluAndMul 在 packed 输出上实现 SwiGLU 非线性。
         self.activation = SiluAndMul()
-        # down_proj maps the sharded intermediate state back to hidden_size.
+        # down_proj 将切分后的 intermediate state 映射回 hidden_size。
         self.down_proj = RowParallelLinear(
             input_size=intermediate_size,
             output_size=hidden_size,
@@ -132,12 +129,12 @@ class LlamaMLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Run gate/up projection, activation, and down projection."""
+        """执行 gate/up 投影、激活和 down projection。"""
         x = self.down_proj(self.activation(self.gate_up(x)))
         return x
 
 class LlamaDecoderLayer(nn.Module):
-    """One pre-norm Llama decoder layer."""
+    """一个 pre-norm Llama decoder 层。"""
 
     def __init__(
         self,
@@ -154,8 +151,8 @@ class LlamaDecoderLayer(nn.Module):
         block_size: int = 256,
     ):
         super().__init__()
-        # The local LayerNorm class implements RMSNorm.  Initial gamma matches
-        # checkpoint shape and is overwritten during weight loading.
+        # 本地 LayerNorm 类实际实现 RMSNorm。初始 gamma 与 checkpoint 形状匹配，
+        # 会在权重加载时被覆盖。
         gamma = torch.ones(hidden_size)
         self.input_layernorm = LayerNorm(gamma)
         self.self_attn = LlamaAttn(
@@ -181,18 +178,17 @@ class LlamaDecoderLayer(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Apply RMSNorm, attention, RMSNorm, and MLP with residual carry."""
+        """带 residual 传递地执行 RMSNorm、attention、RMSNorm 和 MLP。"""
         if residual is not None:
-            # Add previous residual before normalizing, returning the updated
-            # residual for the next sublayer.
+            # 归一化前先加上上一条 residual，并返回更新后的 residual 供下一子层使用。
             x, residual = self.input_layernorm(x, residual)
         else:
-            # First layer has no incoming residual object yet.
+            # 第一层还没有传入的 residual 对象。
             residual = x
             x = self.input_layernorm(x)
 
-        # Position ids must restart at zero for each sequence in a packed prefill
-        # batch, but decode uses the current context length minus one.
+        # packed prefill batch 中，每个序列的 position id 都必须从 0 重新开始；
+        # decode 则使用当前上下文长度减一。
         from myvllm.utils import get_context
         context = get_context()
         if context.is_prefill and context.cu_seqlens_q is not None:
@@ -208,13 +204,13 @@ class LlamaDecoderLayer(nn.Module):
             positions = context.context_lens - 1
 
         x = self.self_attn(x, positions=positions)
-        # The attention output is added to residual inside post_attention_layernorm.
+        # attention 输出会在 post_attention_layernorm 内部加到 residual 上。
         x, residual = self.post_attention_layernorm(x, residual)
         x = self.mlp(x)
         return x, residual
     
 class LlamaModel(nn.Module):
-    """Backbone transformer without the final LM head."""
+    """不包含最终 LM head 的 Transformer 主干。"""
 
     def __init__(
         self,
@@ -234,13 +230,12 @@ class LlamaModel(nn.Module):
     ):
         super().__init__()
 
-        # Token embedding is vocab-parallel and returns replicated hidden states.
+        # token embedding 是词表并行的，最终返回复制到各 rank 的 hidden state。
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=vocab_size,
             embedding_dim=hidden_size,
         )
-        # Decoder stack; every layer shares the same context metadata for the
-        # current forward pass.
+        # decoder 层堆叠；同一次 forward 中每层共享同一份 context 元数据。
         self.layers = nn.ModuleList([
             LlamaDecoderLayer(
                 hidden_size=hidden_size,
@@ -260,7 +255,7 @@ class LlamaModel(nn.Module):
         self.norm = LayerNorm(gamma)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Convert token ids into final hidden states."""
+        """将 token id 转成最终 hidden state。"""
         x = self.embed_tokens(input_ids)
         residual = None
         for layer in self.layers:
@@ -270,7 +265,7 @@ class LlamaModel(nn.Module):
 
 
 class LlamaForCausalLM(nn.Module):
-    """Llama backbone plus vocabulary projection for next-token logits."""
+    """Llama 主干加词表投影，用于得到 next-token logits。"""
 
     def __init__(
             self,
@@ -290,8 +285,7 @@ class LlamaForCausalLM(nn.Module):
             tie_word_embeddings: bool = True
         ):
         super().__init__()
-        # The backbone produces hidden states.  compute_logits() applies lm_head
-        # only when the engine is ready to sample.
+        # 主干只产生 hidden state；engine 准备采样时才由 compute_logits() 应用 lm_head。
         self.model = LlamaModel(
             vocab_size=vocab_size,
             hidden_size=hidden_size,
@@ -312,16 +306,15 @@ class LlamaForCausalLM(nn.Module):
             embedding_dim=hidden_size,
         )
         if tie_word_embeddings:
-            # Reuse embedding weights for output projection when the checkpoint
-            # uses tied input/output embeddings.
+            # 当 checkpoint 使用输入/输出 embedding 绑定时，复用 embedding 权重作为输出投影。
             self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Return hidden states, not logits, to let the runner choose sampling rows."""
+        """返回 hidden state 而非 logits，让 runner 决定哪些行需要采样。"""
         x = self.model(input_ids)
         return x 
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project hidden states to vocabulary logits."""
+        """将 hidden state 投影到词表 logits。"""
         logits = self.lm_head(hidden_states)
         return logits

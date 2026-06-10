@@ -1,4 +1,4 @@
-"""End-to-end throughput comparison between Mini vLLM, vLLM, and Transformers."""
+"""Mini vLLM、vLLM 和 Transformers 的端到端吞吐量对比。"""
 
 import time
 import os
@@ -8,25 +8,25 @@ import matplotlib.pyplot as plt
 
 from transformers import AutoTokenizer,AutoModelForCausalLM
 
-# Mini vLLM imports exercise the local implementation.
+# Mini vLLM 导入用于测试本地实现。
 from myvllm.engine.llm_engine import LLMEngine as MiniLLM
 from myvllm.sampling_parameters import SamplingParams as MiniSamplingParams
 
-# vLLM imports provide the optimized reference implementation.
+# vLLM 导入提供优化后的参考实现。
 from vllm import LLM as VLLM
 from vllm import SamplingParams as VLLMSamplingParams
 
 
 
 config = {
-    # Scheduler/cache settings for Mini vLLM.
+    # Mini vLLM 的 scheduler/cache 设置。
     'max_num_sequences': 16,
     'max_num_batched_tokens': 1024,
     'max_cached_blocks': 1024,
     'block_size': 256,
     'world_size': 1,
 
-    # Qwen3 model parameters.  They must match MODEL_NAME.
+    # Qwen3 模型参数，必须与 MODEL_NAME 匹配。
     'model_name_or_path': 'Qwen/Qwen3-0.6B',
     'enforce_eager': True,
     'vocab_size': 151936,
@@ -44,7 +44,7 @@ config = {
     'max_position': 32768,
     'ffn_bias': False,
 
-    # Warmup/cache sizing.
+    # warmup 和 cache size 计算。
     'max_num_batch_tokens': 4096,
     'max_model_length': 128,
     'gpu_memory_utilization': 0.9,
@@ -63,13 +63,13 @@ OUTPUT_TOKENS = 256
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 def cuda_sync():
-    """Synchronize CUDA timers when a GPU is present."""
+    """存在 GPU 时同步 CUDA 计时。"""
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
 
 def run_minivllm(tokenizer):
-    """Benchmark the local engine and return latency/token/TPS metrics."""
+    """测试本地 engine，并返回 latency/token/TPS 指标。"""
     llm = MiniLLM(config=config)  
     sampling = MiniSamplingParams(
         temperature=0.6,
@@ -86,8 +86,7 @@ def run_minivllm(tokenizer):
         for p in PROMPTS
     ]
 
-    # Warmup avoids measuring one-time compilation, cache allocation, and kernel
-    # initialization costs.
+    # warmup 避免把一次性编译、cache 分配和 kernel 初始化开销计入正式计时。
     for _ in range(WARMUP_STEPS):
         llm.generate(prompts, sampling)
         cuda_sync()
@@ -97,7 +96,7 @@ def run_minivllm(tokenizer):
     cuda_sync()
     end = time.perf_counter()
 
-    # Count generated completion tokens only.
+    # 这里只统计生成出来的 completion token。
     total_tokens = sum(len(x) for x in outputs["token_ids"])
     latency = end - start
 
@@ -109,7 +108,7 @@ def run_minivllm(tokenizer):
 
 
 def run_vllm(tokenizer):
-    """Benchmark upstream vLLM with comparable prompt and sampling settings."""
+    """用可比的 prompt 和采样设置测试上游 vLLM。"""
     llm = VLLM(
         model=MODEL_NAME,
         tokenizer=MODEL_NAME,
@@ -133,7 +132,7 @@ def run_vllm(tokenizer):
         for p in PROMPTS
     ]
 
-    # Warm up vLLM's internal kernels, cache manager, and graph/capture paths.
+    # 预热 vLLM 内部 kernel、cache manager 以及 graph/capture 路径。
     for _ in range(WARMUP_STEPS):
         llm.generate(prompts, sampling)
         cuda_sync()
@@ -154,14 +153,14 @@ def run_vllm(tokenizer):
 
 
 def run_transformers_test(tokenizer):
-    """Benchmark the plain Transformers generate path as a baseline."""
+    """测试原生 Transformers generate 路径，作为基线。"""
     inputs = tokenizer(PROMPTS, return_tensors="pt", padding=True, truncation=True).to(device)
     model = AutoModelForCausalLM.from_pretrained(MODEL_NAME).to(device)
 
-    # Left padding requires an explicit mask so padded tokens are ignored.
+    # left padding 需要显式 attention_mask，确保 padding token 被忽略。
     attention_mask = inputs["attention_mask"]
 
-    # Warm up model weights on device and generation kernels.
+    # 预热设备上的模型权重和生成 kernel。
     for _ in range(WARMUP_STEPS):
         with torch.no_grad():
             model.generate(inputs['input_ids'], attention_mask=attention_mask, max_length=OUTPUT_TOKENS)
@@ -184,8 +183,8 @@ def run_transformers_test(tokenizer):
 
 
 def main():
-    """Run all benchmark variants and print a compact metrics table."""
-    # Use the same tokenizer/template for every engine to keep prompts identical.
+    """运行所有 benchmark 变体，并打印紧凑指标表。"""
+    # 所有 engine 使用同一个 tokenizer/template，保证 prompt 完全一致。
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True, padding_side='left')
 
     print("Running minivllm benchmark...")
@@ -204,7 +203,7 @@ def main():
         "transformers":transformers
     }
 
-    # Print latency, generated-token count, and generated tokens per second.
+    # 打印 latency、生成 token 数和每秒生成 token 数。
     print("\n=== Benchmark Results ===")
     for k, v in results.items():
         print(f"{k}:")

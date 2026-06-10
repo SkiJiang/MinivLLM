@@ -1,4 +1,4 @@
-"""Activation functions used by transformer feed-forward blocks."""
+"""Transformer 前馈网络中使用的激活函数。"""
 
 import torch 
 import torch.nn as nn
@@ -7,10 +7,10 @@ import time
 
 class SiluAndMul(nn.Module):
     """
-    SwiGLU-style activation used after a fused gate/up projection.
+    融合 gate/up 投影之后使用的 SwiGLU 风格激活层。
 
-    The input's last dimension is expected to be twice the intermediate size.
-    The first half is the gate branch, the second half is the value/up branch:
+    输入最后一维应当是 intermediate size 的两倍。前半部分是 gate 分支，
+    后半部分是 value/up 分支：
     output = silu(gate) * value.
     """
 
@@ -19,18 +19,17 @@ class SiluAndMul(nn.Module):
 
     @torch.compile
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Split only on the hidden dimension so all leading dimensions
-        # (batch/sequence or varlen tokens) are preserved unchanged.
+        # 只沿隐藏维拆分，因此 batch/sequence 或 varlen token 等前置维度保持不变。
         x, y = x.chunk(2, -1)
-        # SiLU(gate) controls how much of the value branch passes through.
+        # SiLU(gate) 控制 value 分支有多少信息通过。
         return F.silu(x) * y
 
 if __name__ == "__main__":
-    # Local microbenchmark for the fused activation shape used by large MLPs.
+    # 本地微基准：测试大 MLP 中融合激活形状的执行时间。
     layer = SiluAndMul().cuda()
     input_tensor = torch.randn(8, 4000, 8000).cuda()
     
-    # Warm-up avoids including one-time CUDA kernel setup in timing.
+    # 预热可以避免把一次性的 CUDA kernel 初始化开销计入计时。
     for _ in range(10):
         _ = layer(input_tensor)
 

@@ -1,8 +1,7 @@
-"""High-level generation engine.
+"""高层生成引擎。
 
-LLMEngine owns request submission, scheduling, model execution, and final text
-decoding.  It also starts worker processes when tensor parallelism uses more
-than one GPU.
+LLMEngine 负责请求提交、调度、模型执行以及最终文本解码。当张量并行使用多张
+GPU 时，它还负责启动 worker 进程。
 """
 
 import atexit
@@ -18,35 +17,34 @@ from transformers import AutoTokenizer
 
 
 def worker_process(config, rank, event):
-    """Initialize a non-zero-rank ModelRunner and wait for shared-memory calls."""
-    # Reopen stdout/stderr in line-buffered mode so worker logs appear promptly
-    # while the parent process is still running generation.
+    """初始化非 0 rank 的 ModelRunner，并等待共享内存调用。"""
+    # 将 stdout/stderr 重新打开为行缓冲模式，确保父进程还在生成时 worker 日志能及时输出。
     import sys
     import os
     sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)
     sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', buffering=1)
 
-    # Non-master ranks live in ModelRunner.loop(); rank 0 sends method calls via
-    # shared memory and events.
+    # 非 master rank 会停在 ModelRunner.loop() 中；rank 0 通过共享内存和 event
+    # 向它们发送方法调用。
     model_runner = ModelRunner(config, rank, event)
     model_runner.loop()
 
 
 class LLMEngine:
-    """User-facing wrapper around scheduler, tokenizer, and model runner."""
+    """面向用户的封装，组合 scheduler、tokenizer 和 model runner。"""
 
     def __init__(self, config: dict):
         self.config = config
         world_size = config.get("world_size", 1)
 
-        # Spawn is safer with CUDA than fork because each process initializes
-        # its own CUDA context and joins the distributed process group cleanly.
+        # 对 CUDA 来说 spawn 比 fork 更安全，因为每个进程会独立初始化 CUDA context，
+        # 并干净地加入分布式进程组。
         ctx = mp.get_context("spawn")
         self.processes = []
         self.events = []
 
-        # Rank 0 stays in this process.  Additional ranks run worker_process()
-        # and receive method calls through ModelRunner.write_shm().
+        # rank 0 留在当前进程。其他 rank 运行 worker_process()，并通过
+        # ModelRunner.write_shm() 接收方法调用。
         for i in range(1, world_size):
             event = ctx.Event()
             process = ctx.Process(target=worker_process, args=(config, i, event))
@@ -54,17 +52,16 @@ class LLMEngine:
             self.processes.append(process)
             process.start()
 
-        # The master runner executes locally and coordinates all workers.
+        # master runner 在本进程执行，并负责协调所有 worker。
         self.model_runner = ModelRunner(config, rank=0, event=self.events)
 
-        # The tokenizer is kept in the engine layer because the model runner only
-        # operates on token ids and tensors.
+        # tokenizer 放在 engine 层，因为 model runner 只处理 token id 和 tensor。
         self.tokenizer = AutoTokenizer.from_pretrained(config.get("model_name_or_path", "gpt2"))
         
-        # The scheduler is initialized after ModelRunner because allocate_kv_cache
-        # may refine config["max_cached_blocks"] based on actual GPU memory.  In
-        # multi-rank mode, ModelRunner.__init__ also waits for all ranks to join
-        # the process group before the scheduler starts using cache limits.
+        # scheduler 在 ModelRunner 之后初始化，因为 allocate_kv_cache 可能会根据真实
+        # GPU 显存修正 config["max_cached_blocks"]。多 rank 模式下，
+        # ModelRunner.__init__ 也会先等待所有 rank 加入进程组，然后 scheduler
+        # 才开始使用 cache 上限。
         self.scheduler = Scheduler(
             max_num_sequences=config.get("max_num_sequences", 16),
             max_num_batched_tokens=config.get("max_num_batched_tokens", 1024),
@@ -73,62 +70,56 @@ class LLMEngine:
             eos=config.get("eos", 50256)
         )
 
-        # Register cleanup so worker processes and distributed state are released
-        # even if the caller forgets to call exit() explicitly.
+        # 注册清理函数，即使调用方忘记显式调用 exit()，也能释放 worker 和分布式状态。
         atexit.register(self.exit)
 
 
     def exit(self):
-        """Stop model runners and join worker processes."""
-        # call("exit") also forwards the exit command to workers when world_size
-        # is greater than one.
+        """停止 model runner，并等待 worker 进程结束。"""
+        # world_size > 1 时，call("exit") 也会把退出命令转发给 worker。
         self.model_runner.call("exit")
         del self.model_runner
         for process in self.processes:
             process.join()
 
     def step(self) -> tuple[list[int], bool]:
-        """Run one scheduler/model/postprocess iteration."""
+        """执行一轮 scheduler -> model -> postprocess。"""
         scheduled_sequences, is_prefill = self.scheduler.schedule()
         if not scheduled_sequences:
-            # No work could be scheduled, usually because all queues are empty or
-            # all active sequences were preempted to wait for cache availability.
+            # 没有可调度任务，通常意味着队列为空，或活跃序列被抢占后等待 cache 可用。
             return [], is_prefill
 
-        # ModelRunner returns sampled token ids on rank 0.  Worker ranks execute
-        # the same method for synchronization but do not return tokens.
+        # ModelRunner 在 rank 0 返回采样 token id。worker rank 会执行同样的方法以保持同步，
+        # 但不返回 token。
         outputs = self.model_runner.call("run", scheduled_sequences, is_prefill)
 
         if outputs is not None:
-            # Scheduler.postprocess expects a normal Python list, not a CUDA tensor.
+            # Scheduler.postprocess 需要普通 Python list，而不是 CUDA tensor。
             outputs = outputs.cpu().tolist()
 
-        # Append sampled tokens, check stop conditions, and release finished KV
-        # blocks.
+        # 追加采样 token，检查停止条件，并释放已完成序列的 KV block。
         self.scheduler.postprocess(scheduled_sequences, outputs)
 
-        # Only finished sequences are returned to the external caller; unfinished
-        # sequences remain in the scheduler for more decode steps.
+        # 只把已完成序列返回给外部调用方；未完成序列继续留在 scheduler 中等待后续 decode。
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in scheduled_sequences if seq.is_finished]
 
-        # Prefill processes every uncached prompt token, while decode processes
-        # exactly one token per scheduled sequence.
+        # prefill 会处理所有未命中 cache 的 prompt token；decode 每个被调度序列只处理一个 token。
         num_processed_tokens = sum(len(seq) for seq in scheduled_sequences) if is_prefill else len(scheduled_sequences)
 
         return outputs, num_processed_tokens, is_prefill
 
 
     def add_prompt(self, prompt: str, sampling_params: SamplingParams) -> None:
-        """Tokenize one prompt and add it to the scheduler."""
+        """将一个 prompt tokenize 后加入 scheduler。"""
         self.scheduler.add_sequence(Sequence(token_ids=self.tokenizer.encode(prompt), block_size=self.config['block_size'],sampling_params=sampling_params))
 
     def generate(self, prompts: list[str], sampling_params: SamplingParams) -> list[str]:
-        """Generate completions for all prompts and return text plus token ids."""
+        """为所有 prompt 生成 completion，并返回文本和 token id。"""
         for prompt in prompts:
             self.add_prompt(prompt, sampling_params)
         generated_tokens = {}
 
-        # Drive the engine until both waiting and running queues are empty.
+        # 持续驱动 engine，直到 waiting 和 running 队列都为空。
         while not self.scheduler.is_finished():
             start_t = time.time()
             outputs, num_processed_tokens, is_prefill = self.step()
@@ -140,8 +131,7 @@ class LLMEngine:
                 print(num_processed_tokens, 'number of processed tokens', num_processed_tokens/running_time, "tokens/sec during decoding")
             generated_tokens.update({seq_id: tokens for seq_id, tokens in outputs})
 
-        # Preserve input prompt order even though sequences may finish in a
-        # different order because of batching and stop conditions.
+        # 即使序列因为 batching 和停止条件而以不同顺序完成，也按输入 prompt 顺序返回。
         generated_tokens = [generated_tokens[seq_id] for seq_id in sorted(generated_tokens.keys())]
         output = {'text': [self.tokenizer.decode(tokens) for tokens in generated_tokens], 'token_ids': generated_tokens}
         return output

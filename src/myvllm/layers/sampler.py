@@ -1,4 +1,4 @@
-"""Token sampling utilities."""
+"""Token 采样工具。"""
 
 import torch 
 import torch.nn as nn
@@ -6,11 +6,11 @@ import torch.nn as nn
 
 class SamplerLayer(nn.Module):
     """
-    Sample one token per row of logits with temperature scaling.
+    对 logits 的每一行按 temperature 缩放后采样一个 token。
 
-    The implementation uses the Gumbel-max trick in exponential form:
-    argmax(p / Exp(1)) samples from categorical probabilities p without calling
-    torch.multinomial.
+    这里使用指数形式的 Gumbel-max 技巧：
+    argmax(p / Exp(1)) 可以在不调用 torch.multinomial 的情况下，
+    按类别概率 p 进行采样。
     """
 
     def __init__(self):
@@ -18,12 +18,10 @@ class SamplerLayer(nn.Module):
 
     @torch.compile
     def forward(self, logits: torch.Tensor, temperature: torch.Tensor) -> torch.Tensor:
-        # temperature is per sequence, so unsqueeze makes it broadcast across
-        # the vocabulary dimension.
+        # temperature 是逐序列的，unsqueeze 后可以广播到词表维度。
         logits/= temperature.unsqueeze(-1)
-        # Convert scaled logits into a categorical distribution.
+        # 将缩放后的 logits 转成类别分布。
         probs = torch.softmax(logits, dim=-1)
-        # Dividing by exponential noise and taking argmax is equivalent to
-        # sampling according to probs, while staying easy for torch.compile.
+        # 用指数噪声相除再取 argmax，等价于按 probs 采样，同时更容易被 torch.compile 处理。
         sample_tokens = probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax(dim=-1)
         return sample_tokens

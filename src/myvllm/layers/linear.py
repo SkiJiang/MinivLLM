@@ -1,4 +1,4 @@
-"""Tensor-parallel linear layers and checkpoint shard loaders."""
+"""张量并行 Linear 层以及 checkpoint 分片加载器。"""
 
 import torch.nn as nn 
 import torch
@@ -6,11 +6,10 @@ import torch.distributed as dist
 
 class LinearBase(nn.Module):
     """
-    Base class that attaches custom weight loading to parameters.
+    给参数挂载自定义权重加载逻辑的基类。
 
-    The model is constructed directly in tensor-parallel shape.  Full checkpoint
-    tensors therefore cannot always be copied verbatim; each subclass implements
-    weight_loader() to extract the local shard that belongs to this rank.
+    模型会直接以张量并行后的形状构造，因此完整 checkpoint tensor 不能总是原样拷贝；
+    每个子类通过实现 weight_loader()，抽取属于当前 rank 的本地分片。
     """
 
     def __init__(
@@ -21,56 +20,56 @@ class LinearBase(nn.Module):
         tp_dim: int | None = None
     ):
         super().__init__()
-        # tp_dim records which dimension is sharded: output rows for column
-        # parallel, input columns for row parallel, or None for replicated.
+        # tp_dim 记录哪个维度被切分：column parallel 切输出行，row parallel 切输入列，
+        # replicated 则为 None。
         self.tp_dim = tp_dim 
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
         
-        # Weight is stored in the local shape used by this rank.
+        # weight 以当前 rank 使用的本地形状保存。
         self.weight = nn.Parameter(torch.empty(output_size, input_size))
-        # The loader utility checks this attribute and delegates copying here.
+        # loader 工具会检查这个属性，并把拷贝逻辑委托给这里。
         self.weight.weight_loader = self.weight_loader
 
         if bias:
             self.bias = nn.Parameter(torch.zeros(output_size))
-            # Bias follows the same sharding dimension as weight rows.
+            # bias 沿用 weight 行方向的切分方式。
             self.bias.weight_loader = self.weight_loader 
         else:
             self.register_parameter('bias', None)
 
     def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor):
-        """Copy the relevant checkpoint slice into param."""
+        """将 checkpoint 中相关切片拷贝到 param。"""
         raise NotImplementedError("Subclasses should implement this method.")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply the linear operation for this rank."""
+        """执行当前 rank 对应的 linear 操作。"""
         raise NotImplementedError("Subclasses should implement this method.")
 
 """
-These loaders support the common inference flow:
-1. Build a randomly initialized tensor-parallel model on each GPU.
-2. Read a full checkpoint tensor from disk.
-3. Let each parameter's weight_loader copy only the shard this GPU owns.
+这些 loader 支持常见推理流程：
+1. 在每张 GPU 上构造随机初始化的张量并行模型。
+2. 从磁盘读取完整 checkpoint tensor。
+3. 让每个参数自己的 weight_loader 只拷贝当前 GPU 拥有的分片。
 
 for name, param in model.named_parameters():
     if name in checkpoint:
-        loaded_weight = checkpoint[name]  # full model parameter (4096, 4096)
+        loaded_weight = checkpoint[name]  # 完整模型参数 (4096, 4096)
         
-        # check if the parameter has a custom weight_loader
+        # 检查参数是否有自定义 weight_loader
         if hasattr(param, 'weight_loader'):
-            # call custom weight_loader
+            # 调用自定义 weight_loader
             param.weight_loader(param, loaded_weight)
-            # weight_loader will automatically:
-            # 1. extract the shard corresponding to the current GPU
-            # 2. copy it to param.data
+            # weight_loader 会自动：
+            # 1. 抽取当前 GPU 对应的分片
+            # 2. 将它拷贝到 param.data
         else:
-            # default: copy directly
+            # 默认情况：直接拷贝
             param.data.copy_(loaded_weight)
 """
 
 class ReplicatedLinear(LinearBase):
-    """Linear layer copied identically onto every tensor-parallel rank."""
+    """在每个张量并行 rank 上完整复制的 Linear 层。"""
 
     def __init__(
         self, 
@@ -81,18 +80,18 @@ class ReplicatedLinear(LinearBase):
         super().__init__(input_size, output_size, bias)
 
     def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor):
-        # Replicated weights have the same shape on every rank.
+        # replicated 权重在每个 rank 上形状相同。
         param.data.copy_(loaded_weights)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # No communication is needed because every rank has the full weight.
+        # 每个 rank 都有完整权重，因此不需要通信。
         return nn.functional.linear(x, self.weight, self.bias)
 
 class ColumnParallelLinear(LinearBase):
-    """Shard output features across ranks.
+    """沿输出特征维在多个 rank 间切分。
 
-    A full weight of shape (output_size, input_size) is split along dim 0.  Each
-    rank produces a slice of the output features.
+    完整权重形状为 (output_size, input_size)，沿 dim 0 切分。
+    每个 rank 只产生输出特征中的一片。
     """
 
     def __init__(
@@ -106,7 +105,7 @@ class ColumnParallelLinear(LinearBase):
         super().__init__(input_size, output_size//tp_size, bias, tp_dim=0)
 
     def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor):
-        """Load this rank's output-feature shard from a full tensor."""
+        """从完整 tensor 中加载当前 rank 的输出特征分片。"""
         param_data = param.data 
         full_data_output_size = loaded_weights.size(0)
         shard_size = full_data_output_size // self.tp_size
@@ -116,11 +115,11 @@ class ColumnParallelLinear(LinearBase):
         param_data.copy_(slided_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # The returned tensor contains only this rank's output-feature shard.
+        # 返回 tensor 只包含当前 rank 的输出特征分片。
         return nn.functional.linear(x, self.weight, self.bias)
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
-    """Column-parallel layer that packs several projections into one matrix."""
+    """将多个投影打包到同一个矩阵中的 column-parallel 层。"""
 
     def __init__(
         self, 
@@ -128,8 +127,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         output_sizes: list[int],
         bias: bool = True,
     ):
-        # output_sizes stores the full, unsharded size for each packed segment,
-        # for example [gate_size, up_size] in a SwiGLU MLP.
+        # output_sizes 保存每个被打包片段的完整未切分大小；
+        # 例如 SwiGLU MLP 中的 [gate_size, up_size]。
         self.output_sizes = output_sizes
         super().__init__(input_size, sum(output_sizes), bias)
 
@@ -140,28 +139,28 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             'k_proj.weight': torch.randn(4096, 4096),
             'v_proj.weight': torch.randn(4096, 4096),
         }
-        load to 
+        加载到
         merged_layer = Linear(
             input_size=4096,
             output_sizes=sum([4096, 4096, 4096]),  # Q, K, V
-        ) which is also sharded by tp_size
+        )，并且它同样会被 tp_size 切分
         """
         param_data = param.data
-        # Offset is measured in the local packed parameter after sharding.
+        # offset 按切分后的本地 packed 参数计量。
         offset = sum(self.output_sizes[:loaded_weight_id]) // self.tp_size
         shard_size = self.output_sizes[loaded_weight_id] // self.tp_size
 
-        # Narrow to the packed segment that corresponds to loaded_weight_id.
+        # 定位到 loaded_weight_id 对应的 packed 片段。
         param_data = param_data.narrow(0, offset, shard_size)
 
-        # Then copy this rank's shard from the full checkpoint segment.
+        # 再从完整 checkpoint 片段中拷贝当前 rank 的分片。
         loaded_weights_start_index = self.tp_rank * shard_size
         shard_weights = loaded_weights.narrow(0, loaded_weights_start_index, shard_size)
         param_data.copy_(shard_weights)
 
 
 class QKVColumnParallelLinear(ColumnParallelLinear):
-    """Fused QKV projection with per-rank query/key/value shards."""
+    """融合 QKV 投影，每个 rank 保存自己的 Q/K/V head 分片。"""
 
     def __init__(
         self,
@@ -174,21 +173,21 @@ class QKVColumnParallelLinear(ColumnParallelLinear):
         self.tp_size = dist.get_world_size()
         num_kv_heads = num_kv_heads or num_heads
         self.head_size = head_size
-        # Store local head counts because Q/K/V segments are sharded by heads.
+        # 保存本地 head 数，因为 Q/K/V 片段按 head 切分。
         self.num_heads = num_heads // self.tp_size
         self.num_kv_heads = num_kv_heads // self.tp_size
-        # Per-rank output is [Q heads, K heads, V heads] packed together.
+        # 每个 rank 的输出按 [Q heads, K heads, V heads] 打包。
         self.output_size = head_size * (self.num_heads + 2 * self.num_kv_heads)
-        # Parent divides the full output size by tp_size to allocate local weight.
+        # 父类会把完整输出大小除以 tp_size，以分配本地权重。
         total_output_size = head_size * (num_heads + 2 * num_kv_heads)
         super().__init__(input_size, total_output_size, bias=bias)
 
     def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor, load_weight_id: str):
-        """Load one of q/k/v checkpoint tensors into the fused local parameter."""
+        """将 q/k/v 中某个 checkpoint tensor 加载到融合后的本地参数中。"""
         param_data = param.data
         assert load_weight_id in ['q', 'k', 'v'], "load_weight_id must be one of 'q', 'k', 'v'"
-        # The fused local matrix layout is Q segment, then K segment, then V
-        # segment.  Compute the destination slice for the requested component.
+        # 融合本地矩阵布局依次是 Q 片段、K 片段、V 片段；
+        # 这里为请求的组件计算目标切片。
         if load_weight_id == 'q':
             offset = 0
             shard_size = self.head_size * self.num_heads
@@ -202,7 +201,7 @@ class QKVColumnParallelLinear(ColumnParallelLinear):
             raise ValueError(f"Unknown load_weight_id: {load_weight_id}")
 
         param_data = param_data.narrow(0, offset, shard_size)
-        # Copy the rank-local head shard from the full q/k/v tensor.
+        # 从完整 q/k/v tensor 中拷贝当前 rank 的 head 分片。
         loaded_weights_start_index = self.tp_rank * shard_size
         shard_weights = loaded_weights.narrow(0, loaded_weights_start_index, shard_size)
 
@@ -210,7 +209,7 @@ class QKVColumnParallelLinear(ColumnParallelLinear):
 
 
 class RowParallelLinear(LinearBase):
-    """Shard input features across ranks and all-reduce output sums."""
+    """沿输入特征维切分，并对输出部分和做 all-reduce。"""
 
     def __init__(
         self,
@@ -223,7 +222,7 @@ class RowParallelLinear(LinearBase):
         super().__init__(input_size // tp_size, output_size, bias, tp_dim=1)
 
     def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor):
-        """Load this rank's input-feature shard from a full tensor."""
+        """从完整 tensor 中加载当前 rank 的输入特征分片。"""
         param_data = param.data 
         full_data_input_size = loaded_weights.size(1)
         shard_size = full_data_input_size // self.tp_size
@@ -233,16 +232,16 @@ class RowParallelLinear(LinearBase):
         param_data.copy_(slided_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Each rank computes its partial matrix product over local input columns.
+        # 每个 rank 只基于本地输入列计算部分矩阵乘。
         result = nn.functional.linear(x, self.weight, self.bias)
         if self.tp_size > 1:
-            # Summing partial products reconstructs the full output on every rank.
+            # 对各 rank 的部分结果求和，在每个 rank 上重建完整输出。
             dist.all_reduce(result, op=dist.ReduceOp.SUM)
         return result
 
 
 if __name__ == "__main__":
-    # Minimal smoke check for process-group initialization and construction.
+    # 最小 smoke test：检查进程组初始化和层构造是否可用。
     if dist.is_available() and not dist.is_initialized():
         dist.init_process_group(
             backend="gloo",
